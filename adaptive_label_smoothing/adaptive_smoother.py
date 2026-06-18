@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Any
+import json
+import csv
+import io
 
 from .beta_smoothing import BetaSmoothModule
 from .dynamic_scheduler import DynamicSmoothingScheduler
@@ -85,6 +88,9 @@ class AdaptiveLabelSmoother(nn.Module):
         )
 
         self.register_buffer("_reference_labels", torch.zeros(0))
+
+        self._diagnostic_log: List[Dict[str, Any]] = []
+        self._enable_diagnostics: bool = True
 
     def register_module(self, module_name: str,
                         init_alpha: Optional[float] = None,

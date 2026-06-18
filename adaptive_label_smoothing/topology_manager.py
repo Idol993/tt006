@@ -138,36 +138,24 @@ class TopologyManager(nn.Module):
                     g1 = self._groups[gid1]
                     g2 = self._groups[gid2]
 
-                    if not force_merge and len(self._groups) <= self.max_groups:
-                        can_merge = False
-                        if len(self._groups) > self.max_groups:
-                            can_merge = True
-                    else:
-                        can_merge = True
-
-                    if not can_merge and not force_merge:
-                        continue
-
-                    all_close = True
-                    has_enough_history = True
-                    for m1 in g1.module_names:
-                        for m2 in g2.module_names:
-                            if not self._has_enough_history(m1) or not self._has_enough_history(m2):
-                                has_enough_history = False
-                                break
-                            if not self._are_modules_close(m1, m2):
-                                all_close = False
-                                break
-                        if not all_close or not has_enough_history:
-                            break
-
-                    if all_close and has_enough_history:
+                    if self._groups_are_close(g1, g2):
                         merged_pairs.append((gid1, gid2))
                         self._merge_two_groups(gid1, gid2)
                         changed = True
                         break
 
         return merged_pairs
+
+    def _groups_are_close(self, g1: 'SmoothGroup', g2: 'SmoothGroup') -> bool:
+        for m1 in g1.module_names:
+            if not self._has_enough_history(m1):
+                return False
+            for m2 in g2.module_names:
+                if not self._has_enough_history(m2):
+                    return False
+                if not self._are_modules_close(m1, m2):
+                    return False
+        return True
 
     def _has_enough_history(self, module_name: str) -> bool:
         history = self._module_history.get(module_name, [])
@@ -277,6 +265,75 @@ class TopologyManager(nn.Module):
     def reset_module_history(self, module_name: str) -> None:
         if module_name in self._module_history:
             self._module_history[module_name] = []
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        state = super().state_dict(destination, prefix, keep_vars)
+
+        groups_data = {}
+        for gid, group in self._groups.items():
+            groups_data[gid] = {
+                'group_id': group.group_id,
+                'module_names': list(group.module_names),
+                'alpha': group.alpha.data.clone(),
+                'beta': group.beta.data.clone(),
+                'merge_count': group.merge_count,
+                'split_count': group.split_count,
+            }
+
+        state[prefix + 'topology_groups'] = groups_data
+        state[prefix + 'module_to_group'] = dict(self._module_to_group)
+        state[prefix + 'module_history'] = {k: list(v) for k, v in self._module_history.items()}
+        state[prefix + 'next_group_id'] = self._next_group_id
+        state[prefix + 'step_count'] = self._step_count
+        state[prefix + 'overfitting_modules'] = list(self._overfitting_modules)
+
+        return state
+
+    def load_state_dict(self, state_dict, strict=True):
+        keys_to_extract = [
+            'topology_groups', 'module_to_group', 'module_history',
+            'next_group_id', 'step_count', 'overfitting_modules'
+        ]
+        extracted = {}
+        filtered_state = {}
+        for k, v in state_dict.items():
+            base_key = k.rsplit('.', 1)[-1] if '.' in k else k
+            if base_key in keys_to_extract:
+                extracted[base_key] = v
+            else:
+                filtered_state[k] = v
+
+        super().load_state_dict(filtered_state, strict=strict)
+
+        if 'topology_groups' in extracted:
+            self._groups = {}
+            for gid, gdata in extracted['topology_groups'].items():
+                group = SmoothGroup(
+                    group_id=gdata['group_id'],
+                    module_names=list(gdata['module_names']),
+                    alpha=gdata['alpha'].clone(),
+                    beta=gdata['beta'].clone(),
+                    merge_count=gdata.get('merge_count', 0),
+                    split_count=gdata.get('split_count', 0),
+                )
+                self._groups[gid] = group
+
+        if 'module_to_group' in extracted:
+            self._module_to_group = dict(extracted['module_to_group'])
+
+        if 'module_history' in extracted:
+            self._module_history = {k: list(v) for k, v in extracted['module_history'].items()}
+
+        if 'next_group_id' in extracted:
+            self._next_group_id = extracted['next_group_id']
+
+        if 'step_count' in extracted:
+            self._step_count = extracted['step_count']
+
+        if 'overfitting_modules' in extracted:
+            self._overfitting_modules = set(extracted['overfitting_modules'])
+
+        return {}
 
     def extra_repr(self) -> str:
         return (f"num_classes={self.num_classes}, merge_threshold={self.merge_threshold}, "

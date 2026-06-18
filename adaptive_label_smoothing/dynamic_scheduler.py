@@ -106,3 +106,32 @@ class DynamicSmoothingScheduler(nn.Module):
             self._best_val_acc[module_name] = 0.0
             self._overfit_counter[module_name] = 0
             self._val_acc_history[module_name] = []
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        state = super().state_dict(destination, prefix, keep_vars)
+        state[prefix + '_val_acc_history'] = self._val_acc_history
+        state[prefix + '_best_val_acc'] = self._best_val_acc
+        state[prefix + '_overfit_counter'] = self._overfit_counter
+        return state
+
+    def load_state_dict(self, state_dict, strict=True):
+        keys_to_extract = ['_val_acc_history', '_best_val_acc', '_overfit_counter']
+        extracted = {}
+        filtered_state = {}
+        for k, v in state_dict.items():
+            base_key = k.split('.')[-1] if '.' in k else k
+            if base_key in keys_to_extract:
+                extracted[base_key] = v
+            else:
+                filtered_state[k] = v
+
+        super().load_state_dict(filtered_state, strict=strict)
+
+        if '_val_acc_history' in extracted:
+            self._val_acc_history = extracted['_val_acc_history']
+        if '_best_val_acc' in extracted:
+            self._best_val_acc = extracted['_best_val_acc']
+        if '_overfit_counter' in extracted:
+            self._overfit_counter = extracted['_overfit_counter']
+
+        return {}
