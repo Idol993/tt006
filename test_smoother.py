@@ -471,6 +471,223 @@ class TestAdaptiveLabelSmoother(unittest.TestCase):
         self.assertIsInstance(loss, torch.Tensor)
         self.assertGreater(loss.item(), 0)
 
+    def test_compute_losses(self):
+        labels = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7])
+
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(8, self.num_classes)
+            logits_dict[name] = logits
+
+        result = self.smoother.compute_losses(
+            module_logits=logits_dict,
+            labels=labels
+        )
+
+        self.assertIn("total_loss", result)
+        self.assertIn("classification_loss", result)
+        self.assertIn("consistency_loss", result)
+        self.assertIn("per_module_loss", result)
+        self.assertIn("smoothing_info", result)
+        self.assertIn("step", result)
+
+        self.assertIsInstance(result["total_loss"], torch.Tensor)
+        self.assertIsInstance(result["classification_loss"], torch.Tensor)
+        self.assertIsInstance(result["consistency_loss"], torch.Tensor)
+
+        for name in self.module_names:
+            self.assertIn(name, result["per_module_loss"])
+            self.assertIsInstance(result["per_module_loss"][name], torch.Tensor)
+            self.assertGreater(result["per_module_loss"][name].item(), 0)
+
+    def test_compute_losses_sum_reduction(self):
+        labels = torch.tensor([0, 1, 2, 3])
+
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        result = self.smoother.compute_losses(
+            module_logits=logits_dict,
+            labels=labels,
+            reduction="sum"
+        )
+
+        self.assertGreater(result["classification_loss"].item(), 0)
+
+    def test_state_dict_roundtrip(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes) * 2.0
+            logits_dict[name] = logits
+
+        for _ in range(5):
+            self.smoother.compute_losses(logits_dict, labels)
+
+        state_before = self.smoother.get_smoothing_info()
+        step_before = self.smoother._step_count
+        groups_before = self.smoother.topology_manager.get_module_group_map()
+
+        state_dict = self.smoother.state_dict()
+
+        new_smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes,
+            module_names=self.module_names,
+        )
+        new_smoother.load_state_dict(state_dict)
+
+        state_after = new_smoother.get_smoothing_info()
+        step_after = new_smoother._step_count
+        groups_after = new_smoother.topology_manager.get_module_group_map()
+
+        self.assertEqual(step_before, step_after)
+        self.assertEqual(groups_before, groups_after)
+
+        for name in self.module_names:
+            self.assertAlmostEqual(
+                state_before[name]["module_mean"],
+                state_after[name]["module_mean"],
+                places=5
+            )
+            self.assertAlmostEqual(
+                state_before[name]["group_mean"],
+                state_after[name]["group_mean"],
+                places=5
+            )
+
+    def test_state_dict_preserves_ema(self):
+        probs = torch.rand(4, self.num_classes)
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+
+        self.smoother.update_module_stats("head_0", probs)
+
+        ema_before = self.smoother.smoothing_modules["head_0"].ema_confidence.item()
+
+        state_dict = self.smoother.state_dict()
+
+        new_smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes,
+            module_names=self.module_names,
+        )
+        new_smoother.load_state_dict(state_dict)
+
+        ema_after = new_smoother.smoothing_modules["head_0"].ema_confidence.item()
+
+        self.assertAlmostEqual(ema_before, ema_after, places=6)
+
+    def test_diagnostic_log_recording(self):
+        self.smoother.enable_diagnostics(True)
+
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        initial_log_len = len(self.smoother.get_diagnostic_log())
+
+        for i in range(3):
+            self.smoother.compute_losses(logits_dict, labels)
+
+        log = self.smoother.get_diagnostic_log()
+        self.assertEqual(len(log), initial_log_len + 3)
+
+        first_entry = log[0]
+        self.assertIn("step", first_entry)
+        self.assertIn("num_groups", first_entry)
+        self.assertIn("module_stats", first_entry)
+
+        for name in self.module_names:
+            self.assertIn(name, first_entry["module_stats"])
+            self.assertIn("smoothing_mean", first_entry["module_stats"][name])
+            self.assertIn("group_id", first_entry["module_stats"][name])
+
+    def test_export_diagnostics_json(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        for _ in range(3):
+            self.smoother.compute_losses(logits_dict, labels)
+
+        json_str = self.smoother.export_diagnostics_json()
+        self.assertIsInstance(json_str, str)
+        self.assertTrue(len(json_str) > 0)
+
+        import json
+        data = json.loads(json_str)
+        self.assertIsInstance(data, list)
+        self.assertEqual(len(data), 3)
+
+    def test_export_diagnostics_csv(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        for _ in range(2):
+            self.smoother.compute_losses(logits_dict, labels)
+
+        csv_str = self.smoother.export_diagnostics_csv()
+        self.assertIsInstance(csv_str, str)
+        self.assertTrue(len(csv_str) > 0)
+
+        lines = csv_str.strip().split('\n')
+        self.assertTrue(len(lines) > 1)
+        self.assertIn("step", lines[0])
+        self.assertIn("smoothing_mean", lines[0])
+
+    def test_get_merge_split_events(self):
+        events = self.smoother.get_merge_split_events()
+        self.assertIn("merge_events", events)
+        self.assertIn("split_events", events)
+        self.assertIsInstance(events["merge_events"], list)
+        self.assertIsInstance(events["split_events"], list)
+
+    def test_merge_when_modules_converge(self):
+        merge_window = 5
+        test_smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes,
+            module_names=["mod_a", "mod_b"],
+            merge_threshold=0.02,
+            merge_window=merge_window,
+            max_groups=10,
+        )
+
+        for i in range(merge_window + 2):
+            test_smoother.topology_manager.record_smoothing_value("mod_a", 0.1)
+            test_smoother.topology_manager.record_smoothing_value("mod_b", 0.101)
+
+        initial_groups = test_smoother.topology_manager.num_groups()
+
+        merged_pairs = test_smoother.topology_manager.try_merge_groups()
+
+        self.assertGreater(len(merged_pairs), 0)
+        self.assertLess(test_smoother.topology_manager.num_groups(), initial_groups)
+
+        group_map = test_smoother.topology_manager.get_module_group_map()
+        self.assertEqual(group_map["mod_a"], group_map["mod_b"])
+
+    def test_disable_diagnostics(self):
+        self.smoother.enable_diagnostics(False)
+
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        initial_len = len(self.smoother.get_diagnostic_log())
+        for _ in range(5):
+            self.smoother.compute_losses(logits_dict, labels)
+
+        self.assertEqual(len(self.smoother.get_diagnostic_log()), initial_len)
+
 
 if __name__ == "__main__":
     unittest.main()

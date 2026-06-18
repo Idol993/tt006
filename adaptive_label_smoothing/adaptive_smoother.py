@@ -326,6 +326,350 @@ class AdaptiveLabelSmoother(nn.Module):
 
         return info
 
+    def compute_losses(self,
+                       module_logits: Dict[str, torch.Tensor],
+                       labels: torch.Tensor,
+                       module_val_accs: Optional[Dict[str, float]] = None,
+                       use_group_params: bool = True,
+                       reduction: str = "mean") -> Dict[str, Any]:
+        module_probs = {}
+        for name, logits in module_logits.items():
+            module_probs[name] = F.softmax(logits, dim=-1)
+
+        train_result = self.training_step(
+            labels=labels,
+            module_probs=module_probs,
+            module_val_accs=module_val_accs,
+            use_group_params=use_group_params
+        )
+
+        smooth_labels_dict = train_result["smooth_labels"]
+        per_module_loss = {}
+        total_cls_loss = 0.0
+
+        for name in self.module_names:
+            if name not in module_logits:
+                continue
+
+            logits = module_logits[name]
+            smooth_labels = smooth_labels_dict[name]
+
+            log_probs = F.log_softmax(logits, dim=-1)
+            loss = -(smooth_labels * log_probs).sum(dim=-1)
+
+            if reduction == "mean":
+                loss = loss.mean()
+            elif reduction == "sum":
+                loss = loss.sum()
+
+            per_module_loss[name] = loss
+            total_cls_loss = total_cls_loss + loss
+
+        if reduction == "mean" and len(per_module_loss) > 0:
+            avg_cls_loss = total_cls_loss / len(per_module_loss)
+        else:
+            avg_cls_loss = total_cls_loss
+
+        consistency_loss = train_result["consistency_loss"]
+        total_loss = avg_cls_loss + consistency_loss
+
+        result = {
+            "total_loss": total_loss,
+            "classification_loss": avg_cls_loss,
+            "consistency_loss": consistency_loss,
+            "per_module_loss": per_module_loss,
+            "smooth_labels": smooth_labels_dict,
+            "consistency_scores": train_result["consistency_scores"],
+            "adjust_results": train_result["adjust_results"],
+            "topology_info": train_result["topology_info"],
+            "step": train_result["step"],
+            "smoothing_info": self.get_smoothing_info(),
+        }
+
+        return result
+
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
+        state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+
+        state[prefix + 'module_names'] = list(self.module_names)
+        state[prefix + 'num_classes'] = self.num_classes
+        state[prefix + 'step_count'] = self._step_count
+        state[prefix + 'merge_split_interval'] = self._merge_split_interval
+        state[prefix + 'enable_diagnostics'] = self._enable_diagnostics
+        state[prefix + 'diagnostic_log'] = list(self._diagnostic_log)
+
+        state[prefix + 'scheduler_val_acc_history'] = dict(self.scheduler._val_acc_history)
+        state[prefix + 'scheduler_best_val_acc'] = dict(self.scheduler._best_val_acc)
+        state[prefix + 'scheduler_overfit_counter'] = dict(self.scheduler._overfit_counter)
+
+        topo_state = {}
+        for gid, group in self.topology_manager._groups.items():
+            topo_state[gid] = {
+                'group_id': group.group_id,
+                'module_names': list(group.module_names),
+                'alpha': group.alpha.data.clone(),
+                'beta': group.beta.data.clone(),
+                'merge_count': group.merge_count,
+                'split_count': group.split_count,
+            }
+        state[prefix + 'topology_groups'] = topo_state
+        state[prefix + 'topology_module_to_group'] = dict(self.topology_manager._module_to_group)
+        state[prefix + 'topology_module_history'] = {k: list(v) for k, v in self.topology_manager._module_history.items()}
+        state[prefix + 'topology_next_group_id'] = self.topology_manager._next_group_id
+        state[prefix + 'topology_step_count'] = self.topology_manager._step_count
+        state[prefix + 'topology_overfitting_modules'] = list(self.topology_manager._overfitting_modules)
+
+        return state
+
+    def load_state_dict(self, state_dict, strict=True):
+        own_prefix_keys = [
+            'module_names', 'num_classes', 'step_count',
+            'merge_split_interval', 'enable_diagnostics', 'diagnostic_log',
+            'scheduler_val_acc_history', 'scheduler_best_val_acc', 'scheduler_overfit_counter',
+            'topology_groups', 'topology_module_to_group', 'topology_module_history',
+            'topology_next_group_id', 'topology_step_count', 'topology_overfitting_modules',
+        ]
+
+        extracted = {}
+        filtered_state = {}
+
+        for k, v in state_dict.items():
+            is_own = False
+            for ok in own_prefix_keys:
+                if k.endswith('.' + ok) or k == ok:
+                    extracted[ok] = v
+                    is_own = True
+                    break
+            if not is_own:
+                filtered_state[k] = v
+
+        super().load_state_dict(filtered_state, strict=strict)
+
+        if 'module_names' in extracted:
+            self.module_names = list(extracted['module_names'])
+        if 'step_count' in extracted:
+            self._step_count = extracted['step_count']
+        if 'merge_split_interval' in extracted:
+            self._merge_split_interval = extracted['merge_split_interval']
+        if 'enable_diagnostics' in extracted:
+            self._enable_diagnostics = extracted['enable_diagnostics']
+        if 'diagnostic_log' in extracted:
+            self._diagnostic_log = list(extracted['diagnostic_log'])
+
+        if 'scheduler_val_acc_history' in extracted:
+            self.scheduler._val_acc_history = dict(extracted['scheduler_val_acc_history'])
+        if 'scheduler_best_val_acc' in extracted:
+            self.scheduler._best_val_acc = dict(extracted['scheduler_best_val_acc'])
+        if 'scheduler_overfit_counter' in extracted:
+            self.scheduler._overfit_counter = dict(extracted['scheduler_overfit_counter'])
+
+        from .topology_manager import SmoothGroup
+        if 'topology_groups' in extracted:
+            groups_data = extracted['topology_groups']
+            new_groups = {}
+            for gid, gdata in groups_data.items():
+                group = SmoothGroup(
+                    group_id=gdata['group_id'],
+                    module_names=list(gdata['module_names']),
+                    alpha=gdata['alpha'].clone(),
+                    beta=gdata['beta'].clone(),
+                    merge_count=gdata.get('merge_count', 0),
+                    split_count=gdata.get('split_count', 0),
+                )
+                new_groups[gid] = group
+            self.topology_manager._groups = new_groups
+
+        if 'topology_module_to_group' in extracted:
+            self.topology_manager._module_to_group = dict(extracted['topology_module_to_group'])
+        if 'topology_module_history' in extracted:
+            self.topology_manager._module_history = {k: list(v) for k, v in extracted['topology_module_history'].items()}
+        if 'topology_next_group_id' in extracted:
+            self.topology_manager._next_group_id = extracted['topology_next_group_id']
+        if 'topology_step_count' in extracted:
+            self.topology_manager._step_count = extracted['topology_step_count']
+        if 'topology_overfitting_modules' in extracted:
+            self.topology_manager._overfitting_modules = set(extracted['topology_overfitting_modules'])
+
+        return {}
+
+    def enable_diagnostics(self, enable: bool = True) -> None:
+        self._enable_diagnostics = enable
+
+    def _record_diagnostic(self, step: int, adjust_results: Dict[str, Any],
+                           topology_info: Optional[Dict[str, Any]]) -> None:
+        if not self._enable_diagnostics:
+            return
+
+        entry = {
+            "step": step,
+            "num_groups": self.topology_manager.num_groups(),
+            "module_stats": {},
+            "merged_pairs": [],
+            "split_groups": [],
+        }
+
+        group_map = self.topology_manager.get_module_group_map()
+        for name in self.module_names:
+            adj = adjust_results.get(name, {})
+            group = self.topology_manager.get_group(name)
+            if group is not None:
+                alpha, beta = group.alpha.item(), group.beta.item()
+                group_mean = alpha / (alpha + beta)
+                group_var = alpha * beta / ((alpha + beta) ** 2 * (alpha + beta + 1))
+            else:
+                group_mean = adj.get("current_mean", 0.0)
+                group_var = adj.get("current_var", 0.0)
+
+            entry["module_stats"][name] = {
+                "smoothing_mean": group_mean,
+                "smoothing_var": group_var,
+                "group_id": group_map.get(name),
+                "confidence": self.smoothing_modules[name].ema_confidence.item(),
+                "marginal_entropy": self.smoothing_modules[name].ema_marginal_entropy.item(),
+            }
+
+        if topology_info is not None:
+            entry["merged_pairs"] = [
+                {"group_a": int(p[0]), "group_b": int(p[1])}
+                for p in topology_info.get("merged_pairs", [])
+            ]
+            entry["split_groups"] = [int(g) for g in topology_info.get("split_groups", [])]
+
+        self._diagnostic_log.append(entry)
+
+    def get_diagnostic_log(self) -> List[Dict[str, Any]]:
+        return list(self._diagnostic_log)
+
+    def export_diagnostics_json(self) -> str:
+        def _convert(obj):
+            if isinstance(obj, torch.Tensor):
+                return obj.item()
+            if isinstance(obj, (list, tuple)):
+                return [_convert(x) for x in obj]
+            if isinstance(obj, dict):
+                return {k: _convert(v) for k, v in obj.items()}
+            return obj
+
+        log_data = _convert(self._diagnostic_log)
+        return json.dumps(log_data, indent=2, ensure_ascii=False)
+
+    def save_diagnostics_json(self, filepath: str) -> None:
+        json_str = self.export_diagnostics_json()
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(json_str)
+
+    def export_diagnostics_csv(self) -> str:
+        output = io.StringIO()
+        fieldnames = [
+            "step", "num_groups", "module_name", "group_id",
+            "smoothing_mean", "smoothing_var",
+            "confidence", "marginal_entropy",
+            "merged_from_group", "split_from_group"
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for entry in self._diagnostic_log:
+            step = entry["step"]
+            num_groups = entry["num_groups"]
+
+            merged_map = {}
+            for mp in entry.get("merged_pairs", []):
+                merged_map[mp["group_b"]] = mp["group_a"]
+
+            split_groups = set(entry.get("split_groups", []))
+
+            for mod_name, stats in entry["module_stats"].items():
+                row = {
+                    "step": step,
+                    "num_groups": num_groups,
+                    "module_name": mod_name,
+                    "group_id": stats.get("group_id", -1),
+                    "smoothing_mean": f"{stats.get('smoothing_mean', 0):.6f}",
+                    "smoothing_var": f"{stats.get('smoothing_var', 0):.8f}",
+                    "confidence": f"{stats.get('confidence', 0):.6f}",
+                    "marginal_entropy": f"{stats.get('marginal_entropy', 0):.6f}",
+                    "merged_from_group": "",
+                    "split_from_group": "",
+                }
+
+                gid = stats.get("group_id")
+                if gid in merged_map:
+                    row["merged_from_group"] = str(merged_map[gid])
+                if gid in split_groups:
+                    row["split_from_group"] = str(gid)
+
+                writer.writerow(row)
+
+        return output.getvalue()
+
+    def save_diagnostics_csv(self, filepath: str) -> None:
+        csv_str = self.export_diagnostics_csv()
+        with open(filepath, 'w', encoding='utf-8', newline='') as f:
+            f.write(csv_str)
+
+    def get_merge_split_events(self) -> Dict[str, List[Dict[str, Any]]]:
+        events = {
+            "merge_events": [],
+            "split_events": [],
+        }
+
+        for entry in self._diagnostic_log:
+            step = entry["step"]
+
+            for mp in entry.get("merged_pairs", []):
+                events["merge_events"].append({
+                    "step": step,
+                    "group_a": mp["group_a"],
+                    "group_b": mp["group_b"],
+                })
+
+            for sg in entry.get("split_groups", []):
+                events["split_events"].append({
+                    "step": step,
+                    "group_id": sg,
+                })
+
+        return events
+
+    def training_step(self,
+                      labels: torch.Tensor,
+                      module_probs: Dict[str, torch.Tensor],
+                      module_val_accs: Optional[Dict[str, float]] = None,
+                      use_group_params: bool = True) -> Dict[str, Any]:
+        self._step_count += 1
+
+        self.update_all_stats(module_probs)
+
+        adjust_results = self.adjust_all_smoothing()
+
+        smooth_labels_dict = self.smooth_all_modules(
+            labels=labels,
+            module_probs=module_probs,
+            use_group_params=use_group_params
+        )
+
+        consistency_loss_val, consistency_scores = self.compute_consistency_loss(
+            smooth_labels_dict
+        )
+
+        topology_info = None
+        if self._step_count % self._merge_split_interval == 0:
+            topology_info = self.try_topology_reconstruction(module_val_accs)
+
+        self._record_diagnostic(self._step_count, adjust_results, topology_info)
+
+        result = {
+            "smooth_labels": smooth_labels_dict,
+            "consistency_loss": consistency_loss_val,
+            "consistency_scores": consistency_scores,
+            "adjust_results": adjust_results,
+            "topology_info": topology_info,
+            "step": self._step_count
+        }
+
+        return result
+
     def extra_repr(self) -> str:
         return (f"num_classes={self.num_classes}, "
                 f"num_modules={len(self.module_names)}, "
