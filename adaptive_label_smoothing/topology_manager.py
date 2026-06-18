@@ -147,11 +147,14 @@ class TopologyManager(nn.Module):
     def clear_overfitting_marks(self) -> None:
         self._overfitting_modules.clear()
 
-    def try_merge_groups(self, force_merge: bool = False) -> List[Tuple[int, int]]:
+    def try_merge_groups(self, force_merge: bool = False,
+                         skip_modules: Optional[List[str]] = None) -> List[Tuple[int, int]]:
         merged_pairs = []
 
         if len(self._groups) <= 1:
             return merged_pairs
+
+        skip_set = set(skip_modules) if skip_modules else set()
 
         changed = True
         while changed:
@@ -169,6 +172,12 @@ class TopologyManager(nn.Module):
 
                     g1 = self._groups[gid1]
                     g2 = self._groups[gid2]
+
+                    if skip_set:
+                        has_skip_g1 = any(m in skip_set for m in g1.module_names)
+                        has_skip_g2 = any(m in skip_set for m in g2.module_names)
+                        if has_skip_g1 or has_skip_g2:
+                            continue
 
                     if self._groups_are_close(g1, g2):
                         merged_pairs.append((gid1, gid2))
@@ -220,11 +229,16 @@ class TopologyManager(nn.Module):
         self._groups[gid1] = new_group
         del self._groups[gid2]
 
-    def try_split_groups(self) -> List[int]:
+    def try_split_groups(self, skip_modules: Optional[List[str]] = None) -> List[int]:
         split_groups = []
+
+        skip_set = set(skip_modules) if skip_modules else set()
 
         for gid, group in list(self._groups.items()):
             if len(group.module_names) < self.min_group_size:
+                continue
+
+            if skip_set and any(m in skip_set for m in group.module_names):
                 continue
 
             has_overfit = any(m in self._overfitting_modules for m in group.module_names)

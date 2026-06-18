@@ -212,7 +212,7 @@ def demo_training_loss():
     print(f"    consistency_loss: {details['consistency_loss'].item():.6f}")
     print(f"    log keys: {list(details['log'].keys())}")
     print(f"    log.step: {details['log']['step']}")
-    print(f"    log.num_groups: {details['log']['num_groups']}")
+    print(f"    log.topology/num_groups: {details['log']['topology/num_groups']}")
     print("    [OK] 详细信息完整")
 
     print()
@@ -237,20 +237,28 @@ def demo_warmup_and_freeze():
 
     params_before = smoother.smoothing_modules["h0"].log_alpha.item()
 
-    for i in range(5):
+    for i in range(8):
         smoother.training_loss(logits, y)
 
     params_after_warmup = smoother.smoothing_modules["h0"].log_alpha.item()
-    print(f"  5 步后 (仍在 warmup): in_warmup={smoother.in_warmup}")
+    print(f"  8 步后 (仍在 warmup): in_warmup={smoother.in_warmup}")
     print(f"  h0 log_alpha 变化: {params_before:.6f} -> {params_after_warmup:.6f}")
     print(f"  参数是否未变: {abs(params_before - params_after_warmup) < 1e-5}")
 
-    for i in range(5):
-        smoother.training_loss(logits, y)
-
+    smoother.training_loss(logits, y)
     params_after_adjust = smoother.smoothing_modules["h0"].log_alpha.item()
-    print(f"  10 步后 (已退出 warmup): in_warmup={smoother.in_warmup}")
+    print(f"  9 步后 (仍在 warmup): in_warmup={smoother.in_warmup}")
     print(f"  h0 log_alpha 变化: {params_after_warmup:.6f} -> {params_after_adjust:.6f}")
+
+    smoother.training_loss(logits, y)
+    params_after_exit = smoother.smoothing_modules["h0"].log_alpha.item()
+    print(f"  10 步后 (仍在 warmup): in_warmup={smoother.in_warmup}")
+    print(f"  h0 log_alpha 变化: {params_after_adjust:.6f} -> {params_after_exit:.6f}")
+
+    smoother.training_loss(logits, y)
+    params_after_first_adapt = smoother.smoothing_modules["h0"].log_alpha.item()
+    print(f"  11 步后 (第1次自适应): in_warmup={smoother.in_warmup}")
+    print(f"  h0 log_alpha 变化: {params_after_exit:.6f} -> {params_after_first_adapt:.6f}")
 
     print()
     print("  冻结 h1：")
@@ -296,7 +304,19 @@ def demo_module_summary_and_curves():
         print(f"      平均平滑值: {s['avg_smoothing_mean']:.4f}")
         print(f"      最大方差: {s['max_smoothing_var']:.6f}")
         print(f"      合并次数: {s['merge_count']}, 分裂次数: {s['split_count']}")
+        print(f"      阶段统计数: {len(s['stage_stats'])}")
+        if len(s['stage_stats']) >= 2:
+            for st in s['stage_stats']:
+                print(f"        Stage-{st['stage']}: avg={st['avg_smoothing_mean']:.4f}, "
+                      f"max_var={st['max_smoothing_var']:.6f}")
         print(f"      是否冻结: {s['is_frozen']}")
+
+    print()
+    s_1_5 = smoother.get_module_summary(min_step=1, max_step=5)
+    s_6_15 = smoother.get_module_summary(min_step=6, max_step=15)
+    print(f"  step区间筛选:")
+    print(f"    step 1-5  h0 样本数: {s_1_5['h0']['num_samples']}")
+    print(f"    step 6-15 h0 样本数: {s_6_15['h0']['num_samples']}")
 
     print()
     curves = smoother.get_smoothing_curves()
@@ -307,14 +327,79 @@ def demo_module_summary_and_curves():
     print(f"    h0.smoothing_mean 长度: {len(curves['per_module']['h0']['smoothing_mean'])}")
     print(f"    合并事件数: {len(curves['merge_events'])}")
     print(f"    分裂事件数: {len(curves['split_events'])}")
+    if len(curves['merge_events']) > 0:
+        print(f"    最近合并事件参与模块: {curves['merge_events'][-1]['modules']}")
+
+    curves_5_12 = smoother.get_smoothing_curves(min_step=5, max_step=12)
+    print(f"    区间 step 5-12 的 steps 长度: {len(curves_5_12['steps'])}")
+
     print()
     print("  [OK] 汇总和曲线数据正常")
     print()
 
 
+def demo_training_advanced_options():
+    print("=" * 60)
+    print("Demo 8: 高级训练选项 (权重/忽略头/部分一致性)")
+    print("=" * 60)
+
+    torch.manual_seed(42)
+    model = MultiHeadNet(32, 64, 10, 3)
+    smoother = AdaptiveLabelSmoother(
+        num_classes=10, module_names=model.module_names,
+        base_smoothing=0.1, consistency_weight=0.01,
+    )
+
+    x = torch.randn(8, 32)
+    y = torch.randint(0, 10, (8,))
+    logits = model(x)
+
+    print("  (1) 带 loss 权重:")
+    weights = {"head_0": 2.0, "head_1": 1.0, "head_2": 0.5}
+    loss_w, det_w = smoother.training_loss(
+        logits, y, return_details=True, loss_weights=weights
+    )
+    print(f"    head_0_loss = {det_w['per_module_loss']['head_0'].item():.4f} (权重 2.0)")
+    print(f"    head_1_loss = {det_w['per_module_loss']['head_1'].item():.4f} (权重 1.0)")
+    print(f"    head_2_loss = {det_w['per_module_loss']['head_2'].item():.4f} (权重 0.5)")
+
+    print()
+    print("  (2) 忽略 head_2:")
+    loss_ig, det_ig = smoother.training_loss(
+        logits, y, return_details=True, ignore_modules=["head_2"]
+    )
+    print(f"    active_modules: {det_ig['active_modules']}")
+    print(f"    ignored_modules: {det_ig['ignored_modules']}")
+    print(f"    per_module_loss keys: {list(det_ig['per_module_loss'].keys())}")
+
+    print()
+    print("  (3) 只对 head_0 & head_1 做一致性约束:")
+    loss_c, det_c = smoother.training_loss(
+        logits, y, return_details=True,
+        consistency_modules=["head_0", "head_1"]
+    )
+    print(f"    consistency_modules = {det_c['consistency_modules']}")
+    print(f"    consistency_loss = {det_c['consistency_loss'].item():.6f}")
+
+    print()
+    print("  (4) 稳定的 flat_log 字段 (直接给 WandB/TB):")
+    flat = det_w["flat_log"]
+    print(f"    flat_log 字段数: {len(flat)}")
+    print(f"    loss/total = {flat['loss/total']:.4f}")
+    print(f"    topology/num_groups = {flat['topology/num_groups']}")
+    print(f"    train/frozen_count = {flat['train/frozen_count']}")
+    for name in model.module_names:
+        print(f"    smooth/mean/{name} = {flat[f'smooth/mean/{name}']:.4f}")
+        print(f"    loss/cls/{name} = {flat[f'loss/cls/{name}']:.4f}")
+
+    print()
+    print("  [OK] 高级选项全部正常")
+    print()
+
+
 def main():
     print()
-    print("  模块级自适应标签平滑器 v3.0")
+    print("  模块级自适应标签平滑器 v4.0")
     print()
 
     demo_compute_losses()
@@ -324,6 +409,7 @@ def main():
     demo_training_loss()
     demo_warmup_and_freeze()
     demo_module_summary_and_curves()
+    demo_training_advanced_options()
 
     print("=" * 60)
     print("  所有演示完成！")

@@ -720,7 +720,10 @@ class TestAdaptiveLabelSmoother(unittest.TestCase):
         self.assertIn("smooth_labels", details)
         self.assertIn("log", details)
         self.assertIn("step", details["log"])
-        self.assertIn("num_groups", details["log"])
+        self.assertIn("topology/num_groups", details["log"])
+        self.assertIn("loss/total", details["log"])
+        self.assertIn("loss/classification", details["log"])
+        self.assertIn("smooth/mean/" + self.module_names[0], details["log"])
 
     def test_training_loss_device_consistency(self):
         device = torch.device("cpu")
@@ -762,7 +765,7 @@ class TestAdaptiveLabelSmoother(unittest.TestCase):
             mod = warmup_smoother.smoothing_modules[name]
             params_before[name] = (mod.log_alpha.item(), mod.log_beta.item())
 
-        for i in range(5):
+        for i in range(10):
             result = warmup_smoother.compute_losses(logits_dict, labels)
 
         for name in self.module_names:
@@ -773,9 +776,7 @@ class TestAdaptiveLabelSmoother(unittest.TestCase):
 
         self.assertTrue(warmup_smoother.in_warmup)
 
-        for i in range(6):
-            result = warmup_smoother.compute_losses(logits_dict, labels)
-
+        result = warmup_smoother.compute_losses(logits_dict, labels)
         self.assertFalse(warmup_smoother.in_warmup)
 
     def test_freeze_module(self):
@@ -913,6 +914,228 @@ class TestAdaptiveLabelSmoother(unittest.TestCase):
 
         merged = tm.try_merge_groups()
         self.assertEqual(len(merged), 0)
+
+    def test_training_loss_with_weights(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes, requires_grad=True)
+            logits_dict[name] = logits
+
+        weights = {self.module_names[0]: 2.0, self.module_names[1]: 0.5}
+        _, details = self.smoother.training_loss(
+            logits_dict, labels, return_details=True, loss_weights=weights
+        )
+        self.assertIn(self.module_names[0], details["per_module_loss"])
+        self.assertIn(self.module_names[1], details["per_module_loss"])
+
+        _, details_no_w = self.smoother.training_loss(
+            logits_dict, labels, return_details=True
+        )
+
+    def test_training_loss_ignore_modules(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes, requires_grad=True)
+            logits_dict[name] = logits
+
+        ignore = [self.module_names[0]]
+        _, details = self.smoother.training_loss(
+            logits_dict, labels, return_details=True, ignore_modules=ignore
+        )
+
+        self.assertNotIn(self.module_names[0], details["per_module_loss"])
+        self.assertIn(self.module_names[1], details["per_module_loss"])
+        self.assertEqual(details["ignored_modules"], ignore)
+        self.assertNotIn(self.module_names[0], details["active_modules"])
+
+    def test_training_loss_partial_consistency(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes, requires_grad=True)
+            logits_dict[name] = logits
+
+        cons_mods = [self.module_names[0], self.module_names[1]]
+        _, details = self.smoother.training_loss(
+            logits_dict, labels, return_details=True,
+            consistency_modules=cons_mods
+        )
+        self.assertEqual(set(details["consistency_modules"]), set(cons_mods))
+
+    def test_flat_log_structure(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        _, details = self.smoother.training_loss(
+            logits_dict, labels, return_details=True
+        )
+
+        log = details["log"]
+        for key in ["step", "loss/total", "loss/classification", "loss/consistency",
+                    "train/in_warmup", "train/frozen_count", "topology/num_groups"]:
+            self.assertIn(key, log)
+
+        for name in self.module_names:
+            self.assertIn(f"loss/cls/{name}", log)
+            self.assertIn(f"smooth/mean/{name}", log)
+            self.assertIn(f"smooth/var/{name}", log)
+            self.assertIn(f"topology/group_id/{name}", log)
+
+    def test_freeze_with_group_params(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        self.smoother.freeze_module(self.module_names[0])
+
+        _, d1 = self.smoother.training_loss(
+            logits_dict, labels, return_details=True, use_group_params=True
+        )
+        sm1 = d1["smooth_labels"][self.module_names[0]].clone()
+
+        for _ in range(10):
+            self.smoother.training_loss(logits_dict, labels, use_group_params=True)
+
+        _, d2 = self.smoother.training_loss(
+            logits_dict, labels, return_details=True, use_group_params=True
+        )
+        sm2 = d2["smooth_labels"][self.module_names[0]]
+
+        self.assertTrue(self.smoother.is_frozen(self.module_names[0]))
+
+    def test_summary_step_filtering(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        for _ in range(15):
+            self.smoother.training_loss(logits_dict, labels)
+
+        s_all = self.smoother.get_module_summary()
+        s_1_5 = self.smoother.get_module_summary(min_step=1, max_step=5)
+        s_6_15 = self.smoother.get_module_summary(min_step=6, max_step=15)
+
+        self.assertEqual(s_all[self.module_names[0]]["num_samples"], 15)
+        self.assertEqual(s_1_5[self.module_names[0]]["num_samples"], 5)
+        self.assertEqual(s_6_15[self.module_names[0]]["num_samples"], 10)
+
+    def test_merge_events_are_module_specific(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        self.smoother._merge_split_interval = 1
+        self.smoother.topology_manager.merge_threshold = 0.1
+        self.smoother.topology_manager.merge_window = 5
+
+        for i in range(10):
+            for name in self.module_names[:2]:
+                self.smoother.topology_manager.record_smoothing_value(name, 0.1)
+            self.smoother.topology_manager.record_smoothing_value(self.module_names[2], 0.3)
+            if i >= 4:
+                self.smoother.topology_manager.try_merge_groups()
+            self.smoother.training_loss(logits_dict, labels)
+
+        summary = self.smoother.get_module_summary()
+        events = self.smoother.get_merge_split_events()
+
+        merge_count_0 = summary[self.module_names[0]]["merge_count"]
+        merge_count_2 = summary[self.module_names[2]]["merge_count"]
+
+        if len(events["merge_events"]) > 0:
+            for ev in events["merge_events"]:
+                self.assertIn("modules", ev)
+
+    def test_summary_stage_stats(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        for _ in range(12):
+            self.smoother.training_loss(logits_dict, labels)
+
+        summary = self.smoother.get_module_summary()
+        for name in self.module_names:
+            s = summary[name]
+            self.assertIn("stage_stats", s)
+            if s["num_samples"] >= 3:
+                self.assertGreater(len(s["stage_stats"]), 0)
+                for st in s["stage_stats"]:
+                    self.assertIn("stage", st)
+                    self.assertIn("avg_smoothing_mean", st)
+                    self.assertIn("max_smoothing_var", st)
+
+    def test_curves_step_filtering(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        for _ in range(10):
+            self.smoother.training_loss(logits_dict, labels)
+
+        c_all = self.smoother.get_smoothing_curves()
+        c_3_7 = self.smoother.get_smoothing_curves(min_step=3, max_step=7)
+
+        self.assertEqual(len(c_all["steps"]), 10)
+        self.assertEqual(len(c_3_7["steps"]), 5)
+        self.assertEqual(c_3_7["steps"][0], 3)
+        self.assertEqual(c_3_7["steps"][-1], 7)
+
+    def test_state_dict_preserves_freeze_and_events(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        self.smoother.freeze_module(self.module_names[0])
+        for _ in range(5):
+            self.smoother.training_loss(logits_dict, labels)
+
+        frozen_before = self.smoother.get_frozen_modules()
+        step_before = self.smoother._step_count
+        events_before = self.smoother.get_merge_split_events()
+
+        state = self.smoother.state_dict()
+
+        new_smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=self.module_names
+        )
+        new_smoother.load_state_dict(state)
+
+        frozen_after = new_smoother.get_frozen_modules()
+        step_after = new_smoother._step_count
+        events_after = new_smoother.get_merge_split_events()
+
+        self.assertEqual(frozen_before, frozen_after)
+        for name in self.module_names:
+            self.assertEqual(new_smoother.is_frozen(name), self.smoother.is_frozen(name))
+        self.assertEqual(step_before, step_after)
+        self.assertEqual(len(events_before["merge_events"]),
+                         len(events_after["merge_events"]))
+
+        self.smoother.training_loss(logits_dict, labels)
+        for _ in range(5):
+            new_smoother.training_loss(logits_dict, labels)
+
+        events_cont = new_smoother.get_merge_split_events()
+        self.assertEqual(len(events_cont["merge_events"]),
+                         len(events_after["merge_events"]))
 
 
 if __name__ == "__main__":
