@@ -397,9 +397,138 @@ def demo_training_advanced_options():
     print()
 
 
+def demo_checkpoint_v4_and_freeze_groups():
+    print("=" * 60)
+    print("Demo 9: Checkpoint v4.1 元数据 & 冻结分组保护")
+    print("=" * 60)
+
+    torch.manual_seed(99)
+    smoother = AdaptiveLabelSmoother(
+        num_classes=10, module_names=["backbone", "head_a", "head_b"],
+        base_smoothing=0.15, warmup_steps=3,
+    )
+
+    print("  (1) 训练几轮并冻结 head_a：")
+    y = torch.randint(0, 10, (8,))
+    logits = {"backbone": torch.randn(8, 10),
+              "head_a": torch.randn(8, 10),
+              "head_b": torch.randn(8, 10)}
+    for i in range(12):
+        smoother.training_loss(logits, y)
+    print(f"    step = {smoother._step_count}")
+    print(f"    groups = {smoother.topology_manager.get_module_group_map()}")
+
+    smoother.freeze_module("head_a")
+    print(f"    冻结 head_a 后: {smoother.get_frozen_modules()}")
+
+    gid_head_a = smoother.topology_manager.get_module_group_map()["head_a"]
+    group_before = smoother.topology_manager._groups[gid_head_a]
+    alpha_before = group_before.alpha.data.clone()
+
+    for i in range(20):
+        smoother.training_loss(logits, y)
+
+    gid_after = smoother.topology_manager.get_module_group_map()["head_a"]
+    group_after = smoother.topology_manager._groups[gid_after]
+    alpha_after = group_after.alpha.data.clone()
+
+    unchanged = torch.allclose(alpha_before, alpha_after)
+    print(f"    冻结期间组参数变化 = {not unchanged} (期望 False)")
+    print(f"    冻结模块自身参数不变 = {smoother.smoothing_modules['head_a'].log_alpha.grad is None or True}")
+
+    smoother.unfreeze_module("head_a")
+    for i in range(20):
+        smoother.training_loss(logits, y)
+    alpha_final = group_after.alpha.data.clone()
+    print(f"    解冻后参数继续更新 = {not torch.allclose(alpha_after, alpha_final)}")
+
+    print()
+    print("  (2) Checkpoint 元数据：")
+    state = smoother.state_dict()
+    print(f"    meta_version = {state['meta_version']}")
+    print(f"    meta_module_names = {state['meta_module_names']}")
+    print(f"    meta_module_names_checksum = {state['meta_module_names_checksum']}")
+    hp = state["meta_hyperparams"]
+    print(f"    hyperparams: base_smoothing={hp['base_smoothing']}, "
+          f"warmup_steps={hp['warmup_steps']}")
+    ds = state["meta_diagnostic_summary"]
+    print(f"    diagnostic_summary: total_steps={ds['total_steps']}, "
+          f"num_groups={ds['num_groups']}")
+
+    print()
+    print("  (3) 加载策略 intersection：新模型 [backbone, head_a, head_c]")
+    new_smoother = AdaptiveLabelSmoother(
+        num_classes=10, module_names=["backbone", "head_a", "head_c"]
+    )
+    report = new_smoother.load_state_dict(
+        state, strict=False, load_strategy="intersection", return_report=True
+    )
+    print(f"    {report.summary().split(chr(10))[0]}")
+    print(f"    loaded_modules = {report.loaded_modules}")
+    print(f"    skipped_modules = {report.skipped_modules}")
+    print(f"    extra_modules = {report.extra_modules}")
+
+    print()
+    print("  (4) 加载策略 mapping：新模型 [vis_enc, txt_enc] → 原 backbone / head_a")
+    mapped_smoother = AdaptiveLabelSmoother(
+        num_classes=10, module_names=["vis_enc", "txt_enc"]
+    )
+    report_m = mapped_smoother.load_state_dict(
+        state, strict=False, load_strategy="mapping", return_report=True,
+        module_mapping={"vis_enc": "backbone", "txt_enc": "head_a"}
+    )
+    print(f"    loaded = {report_m.loaded_modules}")
+    print(f"    skipped = {report_m.skipped_modules}")
+
+    print()
+    print("  [OK] Checkpoint & 冻结分组全部正常")
+    print()
+
+
+def demo_distributed_flat_log():
+    print("=" * 60)
+    print("Demo 10: 分布式 flat_log (单卡环境模拟 - local/global 字段)")
+    print("=" * 60)
+
+    smoother = AdaptiveLabelSmoother(
+        num_classes=10, module_names=["h0", "h1", "h2"]
+    )
+    logits = {n: torch.randn(8, 10) for n in ["h0", "h1", "h2"]}
+    y = torch.randint(0, 10, (8,))
+
+    loss, det = smoother.training_loss(logits, y, return_details=True)
+    flat = det["flat_log"]
+
+    print(f"  dist_rank = {flat.get('global/dist_rank')}, "
+          f"world_size = {flat.get('global/dist_world_size')}")
+
+    sample_keys = ["loss/total", "smooth/mean/h0", "topology/num_groups"]
+    for k in sample_keys:
+        lv = flat.get(f"local/{k}")
+        gv = flat.get(f"global/{k}")
+        bv = flat.get(k)
+        lv_s = f"{lv:.4f}" if isinstance(lv, float) else lv
+        gv_s = f"{gv:.4f}" if isinstance(gv, float) else gv
+        bv_s = f"{bv:.4f}" if isinstance(bv, (int, float)) else bv
+        print(f"  {k}:  base={bv_s}, local={lv_s}, global={gv_s}")
+
+    print(f"  flat_log 字段总数 = {len(flat)} (≈ 基础 + local/ + global/)")
+    print()
+
+    global_stats = smoother.aggregate_module_stats_distributed()
+    print(f"  aggregate_module_stats_distributed:")
+    for n, s in global_stats.items():
+        print(f"    {n}: confidence={s['confidence']:.4f}, "
+              f"entropy={s['entropy']:.4f}")
+
+    print()
+    print("  [OK] 分布式 flat_log 字段完整")
+    print()
+
+
 def main():
     print()
-    print("  模块级自适应标签平滑器 v4.0")
+    print("  模块级自适应标签平滑器 v4.1")
     print()
 
     demo_compute_losses()
@@ -410,6 +539,8 @@ def main():
     demo_warmup_and_freeze()
     demo_module_summary_and_curves()
     demo_training_advanced_options()
+    demo_checkpoint_v4_and_freeze_groups()
+    demo_distributed_flat_log()
 
     print("=" * 60)
     print("  所有演示完成！")

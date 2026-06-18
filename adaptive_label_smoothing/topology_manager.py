@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Dict, List, Set, Tuple, Optional, Any
 from dataclasses import dataclass, field
 import copy
 
@@ -148,11 +148,12 @@ class TopologyManager(nn.Module):
         self._overfitting_modules.clear()
 
     def try_merge_groups(self, force_merge: bool = False,
-                         skip_modules: Optional[List[str]] = None) -> List[Tuple[int, int]]:
+                         skip_modules: Optional[List[str]] = None) -> Tuple[List[Tuple[int, int]], List[Dict[str, Any]]]:
         merged_pairs = []
+        merged_details = []
 
         if len(self._groups) <= 1:
-            return merged_pairs
+            return merged_pairs, merged_details
 
         skip_set = set(skip_modules) if skip_modules else set()
 
@@ -180,12 +181,18 @@ class TopologyManager(nn.Module):
                             continue
 
                     if self._groups_are_close(g1, g2):
+                        modules_involved = sorted(g1.module_names + g2.module_names)
                         merged_pairs.append((gid1, gid2))
+                        merged_details.append({
+                            "group_a": gid1,
+                            "group_b": gid2,
+                            "modules": modules_involved,
+                        })
                         self._merge_two_groups(gid1, gid2)
                         changed = True
                         break
 
-        return merged_pairs
+        return merged_pairs, merged_details
 
     def _groups_are_close(self, g1: 'SmoothGroup', g2: 'SmoothGroup') -> bool:
         for m1 in g1.module_names:
@@ -229,8 +236,9 @@ class TopologyManager(nn.Module):
         self._groups[gid1] = new_group
         del self._groups[gid2]
 
-    def try_split_groups(self, skip_modules: Optional[List[str]] = None) -> List[int]:
+    def try_split_groups(self, skip_modules: Optional[List[str]] = None) -> Tuple[List[int], List[Dict[str, Any]]]:
         split_groups = []
+        split_details = []
 
         skip_set = set(skip_modules) if skip_modules else set()
 
@@ -245,10 +253,15 @@ class TopologyManager(nn.Module):
             if not has_overfit:
                 continue
 
+            modules_before = list(group.module_names)
             self._split_group(gid)
             split_groups.append(gid)
+            split_details.append({
+                "group_id": gid,
+                "modules": sorted(modules_before),
+            })
 
-        return split_groups
+        return split_groups, split_details
 
     def _split_group(self, gid: int) -> None:
         group = self._groups[gid]
@@ -291,12 +304,16 @@ class TopologyManager(nn.Module):
     def update_group_params(self, module_name: str,
                             target_alpha: torch.Tensor,
                             target_beta: torch.Tensor,
-                            lr: float = 0.01) -> None:
+                            lr: float = 0.01,
+                            frozen_modules: Optional[Set[str]] = None) -> None:
         group_id = self._module_to_group.get(module_name)
         if group_id is None:
             return
 
         group = self._groups[group_id]
+
+        if frozen_modules and any(m in frozen_modules for m in group.module_names):
+            return
 
         with torch.no_grad():
             group.alpha.data = group.alpha.data + lr * (target_alpha - group.alpha.data)
@@ -311,6 +328,15 @@ class TopologyManager(nn.Module):
     def reset_module_history(self, module_name: str) -> None:
         if module_name in self._module_history:
             self._module_history[module_name] = []
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        for group in self._groups.values():
+            if group.alpha is not None:
+                group.alpha = nn.Parameter(fn(group.alpha.data))
+            if group.beta is not None:
+                group.beta = nn.Parameter(fn(group.beta.data))
+        return self
 
     def extra_repr(self) -> str:
         return (f"num_classes={self.num_classes}, merge_threshold={self.merge_threshold}, "

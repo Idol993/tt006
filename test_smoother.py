@@ -223,7 +223,7 @@ class TestTopologyManager(unittest.TestCase):
         initial_groups = self.manager.num_groups()
 
         self.manager.max_groups = 1
-        merged = self.manager.try_merge_groups()
+        merged, _ = self.manager.try_merge_groups()
 
         self.assertLessEqual(self.manager.num_groups(), initial_groups)
 
@@ -665,7 +665,7 @@ class TestAdaptiveLabelSmoother(unittest.TestCase):
 
         initial_groups = test_smoother.topology_manager.num_groups()
 
-        merged_pairs = test_smoother.topology_manager.try_merge_groups()
+        merged_pairs, _ = test_smoother.topology_manager.try_merge_groups()
 
         self.assertGreater(len(merged_pairs), 0)
         self.assertLess(test_smoother.topology_manager.num_groups(), initial_groups)
@@ -892,7 +892,7 @@ class TestAdaptiveLabelSmoother(unittest.TestCase):
             tm.record_smoothing_value("mod_a", val_a)
             tm.record_smoothing_value("mod_b", val_b)
 
-        merged = tm.try_merge_groups()
+        merged, _ = tm.try_merge_groups()
         self.assertEqual(len(merged), 1)
 
     def test_merge_rejects_jittery_modules(self):
@@ -912,7 +912,7 @@ class TestAdaptiveLabelSmoother(unittest.TestCase):
             tm.record_smoothing_value("mod_a", val_a)
             tm.record_smoothing_value("mod_b", val_b)
 
-        merged = tm.try_merge_groups()
+        merged, _ = tm.try_merge_groups()
         self.assertEqual(len(merged), 0)
 
     def test_training_loss_with_weights(self):
@@ -1136,6 +1136,292 @@ class TestAdaptiveLabelSmoother(unittest.TestCase):
         events_cont = new_smoother.get_merge_split_events()
         self.assertEqual(len(events_cont["merge_events"]),
                          len(events_after["merge_events"]))
+
+    def test_device_migration_cpu_to_cpu(self):
+        smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=self.module_names
+        )
+        labels = torch.zeros(4, dtype=torch.long)
+        logits_dict = {n: torch.randn(4, self.num_classes) for n in self.module_names}
+
+        loss1, det1 = smoother.training_loss(logits_dict, labels, return_details=True)
+
+        smoother.to(torch.device("cpu"))
+
+        self.assertEqual(smoother.device.type, "cpu")
+        for name, mod in smoother.smoothing_modules.items():
+            self.assertEqual(mod.log_alpha.device.type, "cpu")
+
+        for gid, group in smoother.topology_manager._groups.items():
+            self.assertEqual(group.alpha.device.type, "cpu")
+            self.assertEqual(group.beta.device.type, "cpu")
+
+        loss2, det2 = smoother.training_loss(logits_dict, labels, return_details=True)
+        self.assertEqual(loss2.device.type, "cpu")
+        self.assertEqual(det2["classification_loss"].device.type, "cpu")
+        self.assertEqual(det2["consistency_loss"].device.type, "cpu")
+        for name, sl in det2["smooth_labels"].items():
+            self.assertEqual(sl.device.type, "cpu")
+        for name, pl in det2["per_module_loss"].items():
+            self.assertEqual(pl.device.type, "cpu")
+
+    def test_device_migration_logits_labels_same_device(self):
+        smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=self.module_names
+        )
+
+        labels = torch.zeros(4, dtype=torch.long)
+        logits_dict = {n: torch.randn(4, self.num_classes) for n in self.module_names}
+        loss, det = smoother.training_loss(logits_dict, labels, return_details=True)
+
+        self.assertEqual(loss.device, labels.device)
+        for n in self.module_names:
+            self.assertEqual(det["smooth_labels"][n].device, labels.device)
+            self.assertEqual(det["per_module_loss"][n].device, labels.device)
+
+        self.assertIn("loss/total", det["flat_log"])
+        self.assertIn("global/loss/total", det["flat_log"])
+        self.assertIn("local/loss/total", det["flat_log"])
+        self.assertEqual(det["flat_log"]["global/dist_rank"], 0)
+        self.assertEqual(det["flat_log"]["global/dist_world_size"], 1)
+
+    def test_freeze_module_group_params_unchanged(self):
+        smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=["h0", "h1", "h2"],
+            base_smoothing=0.1, merge_window=3, merge_threshold=0.5
+        )
+
+        for _ in range(10):
+            for n in ["h0", "h1", "h2"]:
+                smoother.topology_manager.record_smoothing_value(n, 0.1)
+
+        smoother.topology_manager.try_merge_groups()
+        self.assertEqual(smoother.topology_manager.num_groups(), 1)
+
+        gid0 = smoother.topology_manager.get_module_group_map()["h0"]
+        g_before = smoother.topology_manager._groups[gid0]
+        alpha_before = g_before.alpha.data.clone()
+        beta_before = g_before.beta.data.clone()
+        h1_before = smoother.smoothing_modules["h1"].log_alpha.data.clone()
+
+        smoother.freeze_module("h1")
+        self.assertTrue(smoother.is_frozen("h1"))
+
+        labels = torch.zeros(8, dtype=torch.long)
+        logits_dict = {n: torch.randn(8, self.num_classes) for n in ["h0", "h1", "h2"]}
+        for _ in range(15):
+            smoother.training_loss(logits_dict, labels)
+
+        gid0_after = smoother.topology_manager.get_module_group_map()["h0"]
+        g_after = smoother.topology_manager._groups[gid0_after]
+        alpha_after = g_after.alpha.data.clone()
+        beta_after = g_after.beta.data.clone()
+        h1_after = smoother.smoothing_modules["h1"].log_alpha.data.clone()
+
+        self.assertTrue(torch.allclose(alpha_before, alpha_after),
+                        "冻结模块所在组的参数不应该变化")
+        self.assertTrue(torch.allclose(beta_before, beta_after),
+                        "冻结模块所在组的参数不应该变化")
+        self.assertTrue(torch.allclose(h1_before, h1_after),
+                        "冻结模块自身参数不应该变化")
+
+        smoother.unfreeze_module("h1")
+        self.assertFalse(smoother.is_frozen("h1"))
+
+        for _ in range(20):
+            smoother.training_loss(logits_dict, labels)
+
+        alpha_final = g_after.alpha.data.clone()
+        changed_after_unfreeze = not torch.allclose(alpha_after, alpha_final)
+        self.assertTrue(changed_after_unfreeze, "解冻后分组参数应该继续更新")
+
+    def test_split_events_count_all_original_modules(self):
+        smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=["a", "b", "c"],
+            base_smoothing=0.1, merge_window=2, merge_threshold=0.05,
+            min_group_size=2, overfitting_patience=1
+        )
+        smoother._merge_split_interval = 1
+
+        for _ in range(5):
+            for n in ["a", "b", "c"]:
+                smoother.topology_manager.record_smoothing_value(n, 0.1)
+
+        _, merged_details = smoother.topology_manager.try_merge_groups()
+        self.assertEqual(smoother.topology_manager.num_groups(), 1,
+                         "应该合并为 1 组")
+
+        smoother.topology_manager.mark_overfitting("a")
+        smoother.topology_manager.mark_overfitting("b")
+        smoother.topology_manager.mark_overfitting("c")
+        _, split_details = smoother.topology_manager.try_split_groups()
+        self.assertEqual(len(split_details), 1)
+        self.assertEqual(sorted(split_details[0]["modules"]), ["a", "b", "c"])
+
+        smoother._diagnostic_log = []
+        labels = torch.zeros(4, dtype=torch.long)
+        logits_dict = {n: torch.randn(4, self.num_classes) for n in ["a", "b", "c"]}
+
+        entry = {
+            "step": 50,
+            "num_groups": 1,
+            "module_stats": {},
+            "merged_pairs": [],
+            "merged_details": [],
+            "split_groups": [0],
+            "split_details": [{
+                "group_id": 0,
+                "modules": ["a", "b", "c"],
+            }],
+        }
+        for n in ["a", "b", "c"]:
+            entry["module_stats"][n] = {
+                "smoothing_mean": 0.1, "smoothing_var": 0.001,
+                "group_id": 0 if n == "a" else (1 if n == "b" else 2),
+                "confidence": 0.5, "marginal_entropy": 0.5,
+            }
+        smoother._diagnostic_log.append(entry)
+
+        events = smoother.get_merge_split_events()
+        all_split_mods = set()
+        for ev in events["split_events"]:
+            for m in ev["modules"]:
+                all_split_mods.add(m)
+        self.assertEqual(all_split_mods, {"a", "b", "c"},
+                         f"拆分事件应包含所有原组模块, 实际={all_split_mods}")
+
+        summary = smoother.get_module_summary()
+        for n in ["a", "b", "c"]:
+            self.assertGreaterEqual(summary[n]["split_count"], 0)
+        split_counts = [summary[n]["split_count"] for n in ["a", "b", "c"]]
+        for sc in split_counts:
+            self.assertEqual(sc, split_counts[0],
+                             f"同组拆分所有模块计数应相同, 实际={split_counts}")
+
+        s_filt = smoother.get_module_summary(min_step=40, max_step=60)
+        for n in ["a", "b", "c"]:
+            self.assertEqual(s_filt[n]["split_count"], 1)
+
+        s_out = smoother.get_module_summary(min_step=100, max_step=200)
+        for n in ["a", "b", "c"]:
+            self.assertEqual(s_out[n]["split_count"], 0,
+                             "step 区间外不应统计拆分事件")
+
+    def test_checkpoint_meta_version_and_hyperparams(self):
+        smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=self.module_names,
+            base_smoothing=0.2, warmup_steps=5
+        )
+
+        labels = torch.zeros(4, dtype=torch.long)
+        logits_dict = {n: torch.randn(4, self.num_classes) for n in self.module_names}
+        for _ in range(5):
+            smoother.training_loss(logits_dict, labels)
+
+        state = smoother.state_dict()
+        self.assertIn("meta_version", state)
+        self.assertEqual(state["meta_version"], "4.1.0")
+        self.assertIn("meta_hyperparams", state)
+        self.assertEqual(state["meta_hyperparams"]["num_classes"], self.num_classes)
+        self.assertEqual(state["meta_hyperparams"]["base_smoothing"], 0.2)
+        self.assertEqual(state["meta_hyperparams"]["warmup_steps"], 5)
+        self.assertIn("meta_module_names", state)
+        self.assertEqual(sorted(state["meta_module_names"]), sorted(self.module_names))
+        self.assertIn("meta_module_names_checksum", state)
+        self.assertIn("meta_diagnostic_summary", state)
+        self.assertIn("total_steps", state["meta_diagnostic_summary"])
+        self.assertIn("num_groups", state["meta_diagnostic_summary"])
+
+    def test_checkpoint_load_strategy_intersection(self):
+        smoother_old = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=["h0", "h1", "h2"]
+        )
+        labels = torch.zeros(4, dtype=torch.long)
+        logits_old = {n: torch.randn(4, self.num_classes) for n in ["h0", "h1", "h2"]}
+        for _ in range(6):
+            smoother_old.training_loss(logits_old, labels)
+        smoother_old.freeze_module("h1")
+
+        state = smoother_old.state_dict()
+
+        smoother_new = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=["h0", "h2", "h_new"]
+        )
+        report = smoother_new.load_state_dict(
+            state, strict=False, load_strategy="intersection", return_report=True
+        )
+
+        from adaptive_label_smoothing.adaptive_smoother import CheckpointLoadReport
+        self.assertIsInstance(report, CheckpointLoadReport)
+        self.assertEqual(sorted(report.loaded_modules), ["h0", "h2"])
+        self.assertEqual(report.skipped_modules, ["h_new"])
+        self.assertEqual(report.extra_modules, ["h1"])
+        self.assertTrue(report.version_match)
+        self.assertTrue(smoother_new.is_frozen("h0") or not smoother_new.is_frozen("h0"))
+
+    def test_checkpoint_load_strategy_mapping(self):
+        smoother_old = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=["old_a", "old_b"]
+        )
+        labels = torch.zeros(4, dtype=torch.long)
+        logits_old = {n: torch.randn(4, self.num_classes) for n in ["old_a", "old_b"]}
+        for _ in range(5):
+            smoother_old.training_loss(logits_old, labels)
+
+        state = smoother_old.state_dict()
+
+        smoother_new = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=["new_a", "new_b", "new_c"]
+        )
+        report = smoother_new.load_state_dict(
+            state, strict=False, load_strategy="mapping", return_report=True,
+            module_mapping={"new_a": "old_a", "new_b": "old_b"}
+        )
+
+        self.assertEqual(sorted(report.loaded_modules), ["new_a", "new_b"])
+        self.assertEqual(report.skipped_modules, ["new_c"])
+        self.assertEqual(report.extra_modules, [])
+
+    def test_checkpoint_load_strict_mismatch_raises(self):
+        smoother_old = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=["h0", "h1"]
+        )
+        state = smoother_old.state_dict()
+
+        smoother_new = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=["h0", "h1", "h2"]
+        )
+        with self.assertRaises(RuntimeError):
+            smoother_new.load_state_dict(state, load_strategy="strict", return_report=False)
+
+        report = smoother_new.load_state_dict(state, load_strategy="strict", return_report=True)
+        self.assertGreater(len(report.messages), 0)
+
+    def test_distributed_flat_log_local_global_keys(self):
+        smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes, module_names=self.module_names
+        )
+        labels = torch.zeros(4, dtype=torch.long)
+        logits_dict = {n: torch.randn(4, self.num_classes) for n in self.module_names}
+
+        loss, det = smoother.training_loss(logits_dict, labels, return_details=True)
+        flat = det["flat_log"]
+
+        base_keys = ["loss/total", "loss/classification", "topology/num_groups"]
+        for bk in base_keys:
+            self.assertIn(bk, flat, f"基字段 {bk} 必须存在")
+            self.assertIn("local/" + bk, flat, f"local/{bk} 必须存在")
+            self.assertIn("global/" + bk, flat, f"global/{bk} 必须存在")
+
+        self.assertEqual(flat["local/loss/total"], flat["loss/total"])
+        self.assertAlmostEqual(float(flat["global/loss/total"]), float(flat["loss/total"]), places=5)
+        self.assertEqual(flat["global/dist_rank"], 0)
+        self.assertEqual(flat["global/dist_world_size"], 1)
+
+    def test_distributed_helper_functions_singlerank(self):
+        self.assertFalse(AdaptiveLabelSmoother.is_distributed())
+        self.assertEqual(AdaptiveLabelSmoother.get_rank(), 0)
+        self.assertEqual(AdaptiveLabelSmoother.get_world_size(), 1)
 
 
 if __name__ == "__main__":

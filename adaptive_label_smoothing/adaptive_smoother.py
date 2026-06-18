@@ -1,15 +1,50 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, List, Optional, Tuple, Any, Set, Literal
+from dataclasses import dataclass, field
 import json
 import csv
 import io
+import hashlib
 
 from .beta_smoothing import BetaSmoothModule
 from .dynamic_scheduler import DynamicSmoothingScheduler
 from .topology_manager import TopologyManager
 from .consistency_constraint import TopologyConsistencyLoss
+
+
+CHECKPOINT_VERSION = "4.1.0"
+
+
+@dataclass
+class CheckpointLoadReport:
+    loaded_modules: List[str] = field(default_factory=list)
+    skipped_modules: List[str] = field(default_factory=list)
+    missing_modules: List[str] = field(default_factory=list)
+    extra_modules: List[str] = field(default_factory=list)
+    version_match: bool = True
+    checkpoint_version: str = ""
+    current_version: str = CHECKPOINT_VERSION
+    hyperparams_match: bool = True
+    hyperparams_mismatch_keys: List[str] = field(default_factory=list)
+    messages: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        lines = [f"CheckpointLoadReport:"]
+        lines.append(f"  version: ckpt={self.checkpoint_version} "
+                     f"current={self.current_version} match={self.version_match}")
+        lines.append(f"  hyperparams_match={self.hyperparams_match} "
+                     f"mismatch_keys={self.hyperparams_mismatch_keys}")
+        lines.append(f"  loaded ({len(self.loaded_modules)}): {self.loaded_modules}")
+        lines.append(f"  skipped ({len(self.skipped_modules)}): {self.skipped_modules}")
+        lines.append(f"  missing_in_smoother ({len(self.missing_modules)}): {self.missing_modules}")
+        lines.append(f"  extra_in_ckpt ({len(self.extra_modules)}): {self.extra_modules}")
+        if self.messages:
+            lines.append(f"  messages ({len(self.messages)}):")
+            for m in self.messages:
+                lines.append(f"    - {m}")
+        return "\n".join(lines)
 
 
 class AdaptiveLabelSmoother(nn.Module):
@@ -95,6 +130,29 @@ class AdaptiveLabelSmoother(nn.Module):
         self._diagnostic_log: List[Dict[str, Any]] = []
         self._enable_diagnostics: bool = True
 
+        self._hyperparams = {
+            "num_classes": num_classes,
+            "base_smoothing": base_smoothing,
+            "min_smoothing": min_smoothing,
+            "max_smoothing": max_smoothing,
+            "init_alpha": init_alpha,
+            "init_beta": init_beta,
+            "learnable_params": learnable_params,
+            "consistency_weight": consistency_weight,
+            "distance_type": distance_type,
+            "merge_threshold": merge_threshold,
+            "merge_window": merge_window,
+            "min_group_size": min_group_size,
+            "max_groups": max_groups,
+            "confidence_threshold": confidence_threshold,
+            "entropy_ratio_threshold": entropy_ratio_threshold,
+            "adjust_lr": adjust_lr,
+            "overfitting_patience": overfitting_patience,
+            "overfitting_delta": overfitting_delta,
+            "warmup_steps": warmup_steps,
+            "eps": eps,
+        }
+
     def register_module(self, module_name: str,
                         init_alpha: Optional[float] = None,
                         init_beta: Optional[float] = None) -> None:
@@ -131,7 +189,10 @@ class AdaptiveLabelSmoother(nn.Module):
         effective_use_group = use_group_params and not module.frozen
 
         if effective_use_group:
-            alpha, beta = self.topology_manager.get_module_params(module_name)
+            alpha_orig, beta_orig = self.topology_manager.get_module_params(module_name)
+            target_device = labels.device
+            alpha = alpha_orig.to(target_device) if alpha_orig.device != target_device else alpha_orig
+            beta = beta_orig.to(target_device) if beta_orig.device != target_device else beta_orig
 
             smoothing_mean = alpha / (alpha + beta)
 
@@ -199,14 +260,16 @@ class AdaptiveLabelSmoother(nn.Module):
             target_beta = self._beta_params_from_mean_var(target_mean, target_var)[1]
 
             device = group.alpha.device
-            target_alpha_t = torch.tensor(target_alpha, device=device, dtype=group.alpha.dtype)
-            target_beta_t = torch.tensor(target_beta, device=device, dtype=group.beta.dtype)
+            dtype = group.alpha.dtype
+            target_alpha_t = torch.tensor(target_alpha, device=device, dtype=dtype)
+            target_beta_t = torch.tensor(target_beta, device=device, dtype=dtype)
 
             self.topology_manager.update_group_params(
                 module_name=module_name,
                 target_alpha=target_alpha_t,
                 target_beta=target_beta_t,
-                lr=self.scheduler.adjust_lr
+                lr=self.scheduler.adjust_lr,
+                frozen_modules=self._frozen_modules,
             )
 
         return {
@@ -250,15 +313,17 @@ class AdaptiveLabelSmoother(nn.Module):
 
         frozen_list = self.get_frozen_modules()
 
-        split_groups = self.topology_manager.try_split_groups(skip_modules=frozen_list)
+        split_groups, split_details = self.topology_manager.try_split_groups(skip_modules=frozen_list)
 
-        merged_pairs = self.topology_manager.try_merge_groups(skip_modules=frozen_list)
+        merged_pairs, merged_details = self.topology_manager.try_merge_groups(skip_modules=frozen_list)
 
         info = {
             "num_groups": self.topology_manager.num_groups(),
             "group_sizes": self.topology_manager.get_group_sizes(),
             "split_groups": split_groups,
             "merged_pairs": merged_pairs,
+            "split_details": split_details,
+            "merged_details": merged_details,
             "module_group_map": self.topology_manager.get_module_group_map()
         }
 
@@ -398,9 +463,16 @@ class AdaptiveLabelSmoother(nn.Module):
 
         topology_info = None
         if not self.in_warmup and self._step_count % self._merge_split_interval == 0:
-            topology_info = self.try_topology_reconstruction(module_val_accs)
+            if self.get_rank() == 0:
+                topology_info = self.try_topology_reconstruction(module_val_accs)
+            if self.is_distributed() and self.get_world_size() > 1:
+                topology_info = self._dist_broadcast_topology_decision(topology_info)
 
         self._record_diagnostic(self._step_count, adjust_results, topology_info)
+
+        global_stats = None
+        if self.is_distributed() and self.get_world_size() > 1:
+            global_stats = self.aggregate_module_stats_distributed()
 
         result = {
             "smooth_labels": smooth_labels_dict,
@@ -410,6 +482,9 @@ class AdaptiveLabelSmoother(nn.Module):
             "topology_info": topology_info,
             "step": self._step_count,
             "in_warmup": self.in_warmup,
+            "dist_rank": self.get_rank(),
+            "dist_world_size": self.get_world_size(),
+            "global_module_stats": global_stats,
         }
 
         return result
@@ -531,6 +606,16 @@ class AdaptiveLabelSmoother(nn.Module):
             in_warmup=train_result.get("in_warmup", False),
         )
 
+        if self.is_distributed() and self.get_world_size() > 1:
+            flat_log = self.build_distributed_flat_log(flat_log)
+        else:
+            enhanced = {"local/" + k: v for k, v in flat_log.items()}
+            enhanced.update({"global/" + k: v for k, v in flat_log.items()})
+            enhanced.update(flat_log)
+            enhanced["global/dist_rank"] = 0
+            enhanced["global/dist_world_size"] = 1
+            flat_log = enhanced
+
         result = {
             "total_loss": total_loss,
             "classification_loss": avg_cls_loss,
@@ -597,8 +682,42 @@ class AdaptiveLabelSmoother(nn.Module):
 
         return log
 
+    @staticmethod
+    def _module_list_checksum(module_names: List[str]) -> str:
+        h = hashlib.md5()
+        for n in sorted(module_names):
+            h.update(n.encode("utf-8"))
+        return h.hexdigest()[:12]
+
+    def _build_diagnostic_summary(self) -> Dict[str, Any]:
+        try:
+            summary = self.get_module_summary()
+            compact: Dict[str, Any] = {}
+            for name, s in summary.items():
+                compact[name] = {
+                    "group_id": s.get("current_group_id"),
+                    "avg_smoothing_mean": round(s.get("avg_smoothing_mean", 0), 6),
+                    "max_smoothing_var": round(s.get("max_smoothing_var", 0), 8),
+                    "merge_count": s.get("merge_count", 0),
+                    "split_count": s.get("split_count", 0),
+                    "num_samples": s.get("num_samples", 0),
+                }
+            return {
+                "total_steps": self._step_count,
+                "num_groups": self.topology_manager.num_groups(),
+                "module_stats": compact,
+            }
+        except Exception:
+            return {"total_steps": self._step_count, "num_groups": self.topology_manager.num_groups()}
+
     def state_dict(self, destination=None, prefix='', keep_vars=False):
         state = super().state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
+
+        state[prefix + 'meta_version'] = CHECKPOINT_VERSION
+        state[prefix + 'meta_hyperparams'] = dict(self._hyperparams)
+        state[prefix + 'meta_module_names'] = list(self.module_names)
+        state[prefix + 'meta_module_names_checksum'] = self._module_list_checksum(self.module_names)
+        state[prefix + 'meta_diagnostic_summary'] = self._build_diagnostic_summary()
 
         state[prefix + 'module_names'] = list(self.module_names)
         state[prefix + 'num_classes'] = self.num_classes
@@ -633,7 +752,11 @@ class AdaptiveLabelSmoother(nn.Module):
 
         return state
 
-    def load_state_dict(self, state_dict, strict=True):
+    def load_state_dict(self, state_dict, strict: bool = True,
+                        load_strategy: Literal["strict", "intersection", "mapping"] = "strict",
+                        module_mapping: Optional[Dict[str, str]] = None,
+                        return_report: bool = False):
+        LoadStrategyT = Literal["strict", "intersection", "mapping"]
         own_prefix_keys = [
             'module_names', 'num_classes', 'step_count',
             'merge_split_interval', 'enable_diagnostics', 'diagnostic_log',
@@ -641,25 +764,158 @@ class AdaptiveLabelSmoother(nn.Module):
             'topology_groups', 'topology_module_to_group', 'topology_module_history',
             'topology_next_group_id', 'topology_step_count', 'topology_overfitting_modules',
             'warmup_steps', 'frozen_modules',
+            'meta_version', 'meta_hyperparams', 'meta_module_names',
+            'meta_module_names_checksum', 'meta_diagnostic_summary',
         ]
 
-        extracted = {}
+        report = CheckpointLoadReport()
+        report.current_version = CHECKPOINT_VERSION
+        module_mapping = module_mapping or {}
+
+        extracted: Dict[str, Any] = {}
         filtered_state = {}
+        prefix_found = ""
 
         for k, v in state_dict.items():
             is_own = False
             for ok in own_prefix_keys:
-                if k.endswith('.' + ok) or k == ok:
+                if k.endswith('.' + ok):
+                    extracted[ok] = v
+                    is_own = True
+                    if not prefix_found:
+                        prefix_found = k[:-(len(ok) + 1)]
+                    break
+                elif k == ok:
                     extracted[ok] = v
                     is_own = True
                     break
             if not is_own:
                 filtered_state[k] = v
 
-        super().load_state_dict(filtered_state, strict=strict)
+        ckpt_module_names: List[str] = list(extracted.get('meta_module_names',
+                                                          extracted.get('module_names', [])))
+        report.checkpoint_version = str(extracted.get('meta_version', ''))
+        report.version_match = (report.checkpoint_version == CHECKPOINT_VERSION)
+        if not report.version_match and ckpt_module_names:
+            report.messages.append(
+                f"Checkpoint version mismatch: ckpt={report.checkpoint_version} "
+                f"current={CHECKPOINT_VERSION}; loading best-effort"
+            )
+
+        ckpt_hp = extracted.get('meta_hyperparams', {})
+        if ckpt_hp:
+            mismatch_keys = []
+            for k, v in self._hyperparams.items():
+                if k in ckpt_hp and ckpt_hp[k] != v:
+                    mismatch_keys.append(k)
+            report.hyperparams_mismatch_keys = mismatch_keys
+            report.hyperparams_match = len(mismatch_keys) == 0
+            if mismatch_keys:
+                report.messages.append(f"Hyperparams mismatch keys: {mismatch_keys}")
+
+        ckpt_module_set = set(ckpt_module_names)
+        current_module_set = set(self.module_names)
+
+        if load_strategy == "strict":
+            if ckpt_module_names and sorted(ckpt_module_names) != sorted(self.module_names):
+                missing = sorted(current_module_set - ckpt_module_set)
+                extra = sorted(ckpt_module_set - current_module_set)
+                msg = f"Module list mismatch in strict mode. missing={missing}, extra={extra}"
+                if return_report:
+                    report.messages.append(msg)
+                    report.missing_modules = missing
+                    report.extra_modules = extra
+                    return report
+                else:
+                    raise RuntimeError(msg)
+
+            if not report.version_match:
+                msg = (f"Checkpoint version {report.checkpoint_version} != current "
+                       f"{CHECKPOINT_VERSION} in strict mode")
+                if return_report:
+                    report.messages.append(msg)
+                    return report
+                else:
+                    raise RuntimeError(msg)
+
+            name_remap = {n: n for n in self.module_names}
+            for n in self.module_names:
+                report.loaded_modules.append(n)
+
+        elif load_strategy == "intersection":
+            common = sorted(current_module_set & ckpt_module_set)
+            only_current = sorted(current_module_set - ckpt_module_set)
+            only_ckpt = sorted(ckpt_module_set - current_module_set)
+            name_remap = {n: n for n in common}
+            report.loaded_modules = common
+            report.skipped_modules = only_current
+            report.missing_modules = only_current
+            report.extra_modules = only_ckpt
+            if only_current:
+                report.messages.append(f"New modules not in ckpt, skipped loading: {only_current}")
+            if only_ckpt:
+                report.messages.append(f"Ckpt modules not in current model: {only_ckpt}")
+
+        elif load_strategy == "mapping":
+            name_remap: Dict[str, str] = {}
+            inv_map = {v: k for k, v in module_mapping.items()}
+            for current_name in self.module_names:
+                ckpt_name = module_mapping.get(current_name, current_name)
+                if ckpt_name in ckpt_module_set:
+                    name_remap[current_name] = ckpt_name
+                    report.loaded_modules.append(current_name)
+                else:
+                    report.skipped_modules.append(current_name)
+                    report.missing_modules.append(current_name)
+                    report.messages.append(f"No mapping / no ckpt entry for module {current_name}")
+            for ckpt_name in ckpt_module_names:
+                matched = False
+                for cn in self.module_names:
+                    if name_remap.get(cn) == ckpt_name:
+                        matched = True
+                        break
+                if not matched and ckpt_name not in current_module_set:
+                    report.extra_modules.append(ckpt_name)
+        else:
+            raise ValueError(f"Unknown load_strategy={load_strategy}")
+
+        if strict:
+            super().load_state_dict(filtered_state, strict=strict)
+        else:
+            try:
+                super().load_state_dict(filtered_state, strict=False)
+            except Exception as e:
+                report.messages.append(f"super().load_state_dict warning: {e}")
+
+        ckpt_topology_groups = extracted.get('topology_groups', {})
+        from .topology_manager import SmoothGroup
+
+        remapped_groups = {}
+        for gid, gdata in ckpt_topology_groups.items():
+            remapped_names = []
+            for m_name in gdata.get('module_names', []):
+                matched_current = None
+                for cn, ck in name_remap.items():
+                    if ck == m_name:
+                        matched_current = cn
+                        break
+                if matched_current is not None and matched_current in report.loaded_modules:
+                    remapped_names.append(matched_current)
+            if remapped_names:
+                remapped_groups[gid] = {
+                    **gdata,
+                    'module_names': remapped_names,
+                }
 
         if 'module_names' in extracted:
-            self.module_names = list(extracted['module_names'])
+            final_module_names = []
+            for cn in self.module_names:
+                if cn in report.loaded_modules:
+                    final_module_names.append(cn)
+                else:
+                    final_module_names.append(cn)
+            self.module_names = final_module_names
+
         if 'step_count' in extracted:
             self._step_count = extracted['step_count']
         if 'merge_split_interval' in extracted:
@@ -667,19 +923,78 @@ class AdaptiveLabelSmoother(nn.Module):
         if 'enable_diagnostics' in extracted:
             self._enable_diagnostics = extracted['enable_diagnostics']
         if 'diagnostic_log' in extracted:
-            self._diagnostic_log = list(extracted['diagnostic_log'])
+            orig_log = list(extracted['diagnostic_log'])
+            if load_strategy == "mapping" and module_mapping:
+                remapped_log = []
+                for entry in orig_log:
+                    new_entry = dict(entry)
+                    if "module_stats" in entry:
+                        new_ms = {}
+                        for stat_name, stat_val in entry["module_stats"].items():
+                            matched_current = None
+                            for cn, ck in name_remap.items():
+                                if ck == stat_name:
+                                    matched_current = cn
+                                    break
+                            if matched_current is not None:
+                                new_ms[matched_current] = dict(stat_val)
+                        new_entry["module_stats"] = new_ms
+                    remapped_log.append(new_entry)
+                self._diagnostic_log = remapped_log
+            else:
+                self._diagnostic_log = orig_log
 
         if 'scheduler_val_acc_history' in extracted:
-            self.scheduler._val_acc_history = dict(extracted['scheduler_val_acc_history'])
+            orig = dict(extracted['scheduler_val_acc_history'])
+            remapped = {}
+            for m_name, v in orig.items():
+                matched_current = None
+                for cn, ck in name_remap.items():
+                    if ck == m_name:
+                        matched_current = cn
+                        break
+                if matched_current is not None:
+                    remapped[matched_current] = v
+            self.scheduler._val_acc_history = remapped
         if 'scheduler_best_val_acc' in extracted:
-            self.scheduler._best_val_acc = dict(extracted['scheduler_best_val_acc'])
+            orig = dict(extracted['scheduler_best_val_acc'])
+            remapped = {}
+            for m_name, v in orig.items():
+                matched_current = None
+                for cn, ck in name_remap.items():
+                    if ck == m_name:
+                        matched_current = cn
+                        break
+                if matched_current is not None:
+                    remapped[matched_current] = v
+            self.scheduler._best_val_acc = remapped
         if 'scheduler_overfit_counter' in extracted:
-            self.scheduler._overfit_counter = dict(extracted['scheduler_overfit_counter'])
+            orig = dict(extracted['scheduler_overfit_counter'])
+            remapped = {}
+            for m_name, v in orig.items():
+                matched_current = None
+                for cn, ck in name_remap.items():
+                    if ck == m_name:
+                        matched_current = cn
+                        break
+                if matched_current is not None:
+                    remapped[matched_current] = v
+            self.scheduler._overfit_counter = remapped
 
         if 'warmup_steps' in extracted:
             self._warmup_steps = extracted['warmup_steps']
         if 'frozen_modules' in extracted:
-            self._frozen_modules = set(extracted['frozen_modules'])
+            ckpt_frozen = list(extracted['frozen_modules'])
+            remapped_frozen = set()
+            for m_name in ckpt_frozen:
+                matched_current = None
+                for cn, ck in name_remap.items():
+                    if ck == m_name:
+                        matched_current = cn
+                        break
+                if matched_current is not None:
+                    remapped_frozen.add(matched_current)
+            self._frozen_modules = remapped_frozen
             for name in self.module_names:
                 if name in self.smoothing_modules:
                     mod = self.smoothing_modules[name]
@@ -688,33 +1003,63 @@ class AdaptiveLabelSmoother(nn.Module):
                     else:
                         mod.unfreeze()
 
-        from .topology_manager import SmoothGroup
-        if 'topology_groups' in extracted:
-            groups_data = extracted['topology_groups']
-            new_groups = {}
-            for gid, gdata in groups_data.items():
-                group = SmoothGroup(
-                    group_id=gdata['group_id'],
-                    module_names=list(gdata['module_names']),
-                    alpha=gdata['alpha'].clone(),
-                    beta=gdata['beta'].clone(),
-                    merge_count=gdata.get('merge_count', 0),
-                    split_count=gdata.get('split_count', 0),
-                )
-                new_groups[gid] = group
+        new_groups: Dict[int, SmoothGroup] = {}
+        for gid, gdata in remapped_groups.items():
+            group = SmoothGroup(
+                group_id=gdata['group_id'],
+                module_names=list(gdata['module_names']),
+                alpha=gdata['alpha'].clone(),
+                beta=gdata['beta'].clone(),
+                merge_count=gdata.get('merge_count', 0),
+                split_count=gdata.get('split_count', 0),
+            )
+            new_groups[gid] = group
+        if new_groups:
             self.topology_manager._groups = new_groups
 
         if 'topology_module_to_group' in extracted:
-            self.topology_manager._module_to_group = dict(extracted['topology_module_to_group'])
+            orig = dict(extracted['topology_module_to_group'])
+            remapped = {}
+            for m_name, gid in orig.items():
+                matched_current = None
+                for cn, ck in name_remap.items():
+                    if ck == m_name:
+                        matched_current = cn
+                        break
+                if matched_current is not None:
+                    remapped[matched_current] = gid
+            self.topology_manager._module_to_group = remapped
         if 'topology_module_history' in extracted:
-            self.topology_manager._module_history = {k: list(v) for k, v in extracted['topology_module_history'].items()}
+            orig = {k: list(v) for k, v in extracted['topology_module_history'].items()}
+            remapped = {}
+            for m_name, v in orig.items():
+                matched_current = None
+                for cn, ck in name_remap.items():
+                    if ck == m_name:
+                        matched_current = cn
+                        break
+                if matched_current is not None:
+                    remapped[matched_current] = list(v)
+            self.topology_manager._module_history = remapped
         if 'topology_next_group_id' in extracted:
             self.topology_manager._next_group_id = extracted['topology_next_group_id']
         if 'topology_step_count' in extracted:
             self.topology_manager._step_count = extracted['topology_step_count']
         if 'topology_overfitting_modules' in extracted:
-            self.topology_manager._overfitting_modules = set(extracted['topology_overfitting_modules'])
+            orig = list(extracted['topology_overfitting_modules'])
+            remapped = set()
+            for m_name in orig:
+                matched_current = None
+                for cn, ck in name_remap.items():
+                    if ck == m_name:
+                        matched_current = cn
+                        break
+                if matched_current is not None:
+                    remapped.add(matched_current)
+            self.topology_manager._overfitting_modules = remapped
 
+        if return_report:
+            return report
         return {}
 
     def enable_diagnostics(self, enable: bool = True) -> None:
@@ -731,6 +1076,8 @@ class AdaptiveLabelSmoother(nn.Module):
             "module_stats": {},
             "merged_pairs": [],
             "split_groups": [],
+            "merged_details": [],
+            "split_details": [],
         }
 
         group_map = self.topology_manager.get_module_group_map()
@@ -759,6 +1106,8 @@ class AdaptiveLabelSmoother(nn.Module):
                 for p in topology_info.get("merged_pairs", [])
             ]
             entry["split_groups"] = [int(g) for g in topology_info.get("split_groups", [])]
+            entry["merged_details"] = list(topology_info.get("merged_details", []))
+            entry["split_details"] = list(topology_info.get("split_details", []))
 
         self._diagnostic_log.append(entry)
 
@@ -848,40 +1197,65 @@ class AdaptiveLabelSmoother(nn.Module):
             if max_step is not None and step > max_step:
                 continue
 
-            module_group_map_prev = None
-            if "module_stats" in entry:
-                module_group_map_prev = {}
-                for m, s in entry["module_stats"].items():
-                    module_group_map_prev[m] = s.get("group_id", -1)
+            merged_details = entry.get("merged_details", [])
+            if merged_details:
+                for md in merged_details:
+                    events["merge_events"].append({
+                        "step": step,
+                        "group_a": md["group_a"],
+                        "group_b": md["group_b"],
+                        "modules": sorted(md["modules"]),
+                    })
+            else:
+                module_group_map_prev = None
+                if "module_stats" in entry:
+                    module_group_map_prev = {}
+                    for m, s in entry["module_stats"].items():
+                        module_group_map_prev[m] = s.get("group_id", -1)
 
-            for mp in entry.get("merged_pairs", []):
-                involved_modules = []
-                if module_group_map_prev is not None:
-                    gid_a = mp["group_a"]
-                    gid_b = mp["group_b"]
-                    for m, gid in module_group_map_prev.items():
-                        if gid in (gid_a, gid_b):
-                            involved_modules.append(m)
+                for mp in entry.get("merged_pairs", []):
+                    involved_modules = []
+                    if module_group_map_prev is not None:
+                        gid_a = mp["group_a"]
+                        gid_b = mp["group_b"]
+                        for m, gid in module_group_map_prev.items():
+                            if gid in (gid_a, gid_b):
+                                involved_modules.append(m)
 
-                events["merge_events"].append({
-                    "step": step,
-                    "group_a": mp["group_a"],
-                    "group_b": mp["group_b"],
-                    "modules": sorted(involved_modules),
-                })
+                    events["merge_events"].append({
+                        "step": step,
+                        "group_a": mp["group_a"],
+                        "group_b": mp["group_b"],
+                        "modules": sorted(involved_modules),
+                    })
 
-            for sg in entry.get("split_groups", []):
-                involved_modules = []
-                if module_group_map_prev is not None:
-                    for m, gid in module_group_map_prev.items():
-                        if gid == sg:
-                            involved_modules.append(m)
+            split_details = entry.get("split_details", [])
+            if split_details:
+                for sd in split_details:
+                    events["split_events"].append({
+                        "step": step,
+                        "group_id": sd["group_id"],
+                        "modules": sorted(sd["modules"]),
+                    })
+            else:
+                module_group_map_prev = None
+                if "module_stats" in entry:
+                    module_group_map_prev = {}
+                    for m, s in entry["module_stats"].items():
+                        module_group_map_prev[m] = s.get("group_id", -1)
 
-                events["split_events"].append({
-                    "step": step,
-                    "group_id": sg,
-                    "modules": sorted(involved_modules),
-                })
+                for sg in entry.get("split_groups", []):
+                    involved_modules = []
+                    if module_group_map_prev is not None:
+                        for m, gid in module_group_map_prev.items():
+                            if gid == sg:
+                                involved_modules.append(m)
+
+                    events["split_events"].append({
+                        "step": step,
+                        "group_id": sg,
+                        "modules": sorted(involved_modules),
+                    })
 
         return events
 
@@ -1054,3 +1428,189 @@ class AdaptiveLabelSmoother(nn.Module):
         return (f"num_classes={self.num_classes}, "
                 f"num_modules={len(self.module_names)}, "
                 f"num_groups={self.topology_manager.num_groups()}")
+
+    # ------------------------------------------------------------------
+    # 设备迁移辅助
+    # ------------------------------------------------------------------
+    @property
+    def device(self) -> torch.device:
+        if len(self.smoothing_modules) > 0:
+            first = next(iter(self.smoothing_modules.values()))
+            return first.log_alpha.device
+        return torch.device("cpu")
+
+    def to_device(self, device):
+        return self.to(torch.device(device))
+
+    # ------------------------------------------------------------------
+    # 分布式训练接入
+    # ------------------------------------------------------------------
+    @staticmethod
+    def is_distributed() -> bool:
+        try:
+            import torch.distributed as dist
+            return dist.is_available() and dist.is_initialized()
+        except Exception:
+            return False
+
+    @staticmethod
+    def get_rank() -> int:
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                return dist.get_rank()
+        except Exception:
+            pass
+        return 0
+
+    @staticmethod
+    def get_world_size() -> int:
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                return dist.get_world_size()
+        except Exception:
+            pass
+        return 1
+
+    def _dist_all_reduce_mean_(self, tensor: torch.Tensor) -> torch.Tensor:
+        if not self.is_distributed():
+            return tensor
+        try:
+            import torch.distributed as dist
+            world = self.get_world_size()
+            if world > 1:
+                tensor = tensor.clone()
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                tensor = tensor / world
+            return tensor
+        except Exception:
+            return tensor
+
+    def _dist_all_reduce_dict_means(self, value_dict: Dict[str, Any]
+                                     ) -> Dict[str, Any]:
+        if not self.is_distributed() or self.get_world_size() <= 1:
+            return value_dict
+        reduced: Dict[str, Any] = {}
+        for k, v in value_dict.items():
+            if isinstance(v, torch.Tensor):
+                reduced[k] = self._dist_all_reduce_mean_(v)
+            elif isinstance(v, (int, float)):
+                t = torch.tensor(float(v), device=self.device)
+                reduced[k] = float(self._dist_all_reduce_mean_(t).item())
+            else:
+                reduced[k] = v
+        return reduced
+
+    def _dist_broadcast_topology_decision(self, topology_info: Optional[Dict[str, Any]]
+                                           ) -> Optional[Dict[str, Any]]:
+        if not self.is_distributed() or self.get_world_size() <= 1:
+            return topology_info
+        try:
+            import torch.distributed as dist
+            rank = self.get_rank()
+
+            if topology_info is None:
+                serialized: bytes = b""
+            else:
+                import pickle
+                sanitized = {}
+                for k, v in topology_info.items():
+                    if isinstance(v, dict):
+                        sanitized[k] = {kk: (vv.item() if isinstance(vv, torch.Tensor) else vv)
+                                       for kk, vv in v.items()}
+                    elif isinstance(v, (list, tuple)):
+                        sanitized[k] = [(x.item() if isinstance(x, torch.Tensor) else x) for x in v]
+                    elif isinstance(v, torch.Tensor):
+                        sanitized[k] = v.item()
+                    else:
+                        sanitized[k] = v
+                serialized = pickle.dumps(sanitized)
+
+            length_t = torch.tensor(len(serialized), dtype=torch.long, device=self.device)
+            dist.broadcast(length_t, src=0)
+            target_len = int(length_t.item())
+
+            if rank == 0:
+                data_t = torch.frombuffer(bytearray(serialized), dtype=torch.uint8).to(self.device)
+            else:
+                data_t = torch.zeros(target_len, dtype=torch.uint8, device=self.device)
+
+            if data_t.numel() < target_len:
+                pad = torch.zeros(target_len - data_t.numel(), dtype=torch.uint8, device=self.device)
+                data_t = torch.cat([data_t, pad])
+
+            dist.broadcast(data_t, src=0)
+
+            import pickle
+            bytes_data = bytes(data_t.cpu().numpy().tobytes()[:target_len])
+            if len(bytes_data) == 0:
+                return None
+            recovered = pickle.loads(bytes_data)
+            return recovered
+        except Exception:
+            return topology_info
+
+    def aggregate_module_stats_distributed(self) -> Dict[str, Dict[str, float]]:
+        """将各 rank 上的置信度、边缘熵做 all-reduce mean，返回全局值 dict。"""
+        local: Dict[str, Dict[str, float]] = {}
+        for name in self.module_names:
+            mod = self.smoothing_modules[name]
+            local[name] = {
+                "confidence": float(mod.ema_confidence.item()),
+                "entropy": float(mod.ema_marginal_entropy.item()),
+            }
+        if not self.is_distributed() or self.get_world_size() <= 1:
+            return local
+
+        reduced = {}
+        for name, d in local.items():
+            conf_t = torch.tensor(d["confidence"], device=self.device)
+            ent_t = torch.tensor(d["entropy"], device=self.device)
+            conf_g = float(self._dist_all_reduce_mean_(conf_t).item())
+            ent_g = float(self._dist_all_reduce_mean_(ent_t).item())
+            reduced[name] = {"confidence": conf_g, "entropy": ent_g}
+        return reduced
+
+    def build_distributed_flat_log(self,
+                                   local_flat_log: Dict[str, Any]
+                                   ) -> Dict[str, Any]:
+        """在 local_flat_log 基础上加上 global_ 前缀的全局指标。"""
+        result: Dict[str, Any] = {"local/" + k: v for k, v in local_flat_log.items()}
+        result.update(local_flat_log)
+
+        if not self.is_distributed() or self.get_world_size() <= 1:
+            for k, v in local_flat_log.items():
+                if isinstance(v, (int, float)):
+                    result["global/" + k] = float(v)
+                elif isinstance(v, torch.Tensor):
+                    result["global/" + k] = float(v.item())
+                else:
+                    result["global/" + k] = v
+            result["global/dist_rank"] = 0
+            result["global/dist_world_size"] = 1
+            return result
+
+        result["global/dist_rank"] = self.get_rank()
+        result["global/dist_world_size"] = self.get_world_size()
+
+        numeric_keys = [k for k, v in local_flat_log.items()
+                        if isinstance(v, (int, float, torch.Tensor))]
+        local_vals = []
+        for k in numeric_keys:
+            v = local_flat_log[k]
+            if isinstance(v, torch.Tensor):
+                local_vals.append(float(v.item()))
+            else:
+                local_vals.append(float(v))
+        stacked = torch.tensor(local_vals, device=self.device)
+        global_vals = self._dist_all_reduce_mean_(stacked)
+
+        for k, gv in zip(numeric_keys, global_vals.tolist()):
+            result["global/" + k] = float(gv)
+
+        for k in local_flat_log:
+            if k not in numeric_keys:
+                result["global/" + k] = local_flat_log[k]
+
+        return result
