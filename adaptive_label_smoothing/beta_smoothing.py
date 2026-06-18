@@ -14,6 +14,7 @@ class BetaSmoothModule(nn.Module):
         self.num_classes = num_classes
         self.eps = eps
         self.learnable_params = learnable_params
+        self._frozen = False
 
         if learnable_params:
             self.log_alpha = nn.Parameter(torch.tensor(init_alpha).log())
@@ -25,6 +26,16 @@ class BetaSmoothModule(nn.Module):
         self.register_buffer("_ema_confidence", torch.tensor(1.0 / num_classes))
         self.register_buffer("_ema_marginal_entropy", torch.tensor(0.0))
         self._ema_momentum = 0.9
+
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
+
+    def freeze(self) -> None:
+        self._frozen = True
+
+    def unfreeze(self) -> None:
+        self._frozen = False
 
     @property
     def alpha(self) -> torch.Tensor:
@@ -106,6 +117,9 @@ class BetaSmoothModule(nn.Module):
 
     def adjust_beta_params(self, target_mean: float, target_var: float,
                            lr: float = 0.01) -> None:
+        if self._frozen:
+            return
+
         with torch.no_grad():
             current_mean = self.smoothing_mean.item()
             current_var = self.smoothing_var.item()

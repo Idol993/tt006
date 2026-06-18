@@ -109,6 +109,38 @@ class TopologyManager(nn.Module):
         avg2 = self._avg_smoothing(name2)
         return abs(avg1 - avg2) < self.merge_threshold
 
+    def _are_modules_stable_close(self, name1: str, name2: str) -> bool:
+        hist1 = self._module_history.get(name1, [])
+        hist2 = self._module_history.get(name2, [])
+
+        if len(hist1) < self.merge_window or len(hist2) < self.merge_window:
+            return False
+
+        h1 = hist1[-self.merge_window:]
+        h2 = hist2[-self.merge_window:]
+
+        max_diff = 0.0
+        for v1, v2 in zip(h1, h2):
+            diff = abs(v1 - v2)
+            if diff > self.merge_threshold:
+                return False
+            max_diff = max(max_diff, diff)
+
+        var1 = self._window_variance(h1)
+        var2 = self._window_variance(h2)
+        max_var = max(var1, var2)
+        if max_var > self.merge_threshold * self.merge_threshold:
+            return False
+
+        return True
+
+    def _window_variance(self, values: List[float]) -> float:
+        if len(values) <= 1:
+            return 0.0
+        mean = sum(values) / len(values)
+        var = sum((v - mean) ** 2 for v in values) / len(values)
+        return var
+
     def mark_overfitting(self, module_name: str) -> None:
         self._overfitting_modules.add(module_name)
 
@@ -153,7 +185,7 @@ class TopologyManager(nn.Module):
             for m2 in g2.module_names:
                 if not self._has_enough_history(m2):
                     return False
-                if not self._are_modules_close(m1, m2):
+                if not self._are_modules_stable_close(m1, m2):
                     return False
         return True
 

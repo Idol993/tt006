@@ -178,15 +178,152 @@ def demo_diagnostics():
     print()
 
 
+def demo_training_loss():
+    print("=" * 60)
+    print("Demo 5: training_loss() 训练循环入口")
+    print("=" * 60)
+
+    torch.manual_seed(42)
+    model = MultiHeadNet(32, 64, 10, 3)
+    smoother = AdaptiveLabelSmoother(
+        num_classes=10, module_names=model.module_names,
+        base_smoothing=0.1, consistency_weight=0.01,
+    )
+    opt = optim.Adam(model.parameters(), lr=1e-3)
+
+    x = torch.randn(8, 32)
+    y = torch.randint(0, 10, (8,))
+
+    print("  简单用法 - 直接返回 loss：")
+    opt.zero_grad()
+    logits = model(x)
+    loss = smoother.training_loss(logits, y)
+    print(f"    loss: {loss.item():.4f}, requires_grad: {loss.requires_grad}")
+    loss.backward()
+    opt.step()
+    print("    [OK] 反向传播正常")
+
+    print()
+    print("  详细模式 - 返回 loss + details + log：")
+    logits = model(x)
+    loss, details = smoother.training_loss(logits, y, return_details=True)
+    print(f"    loss: {loss.item():.4f}")
+    print(f"    classification_loss: {details['classification_loss'].item():.4f}")
+    print(f"    consistency_loss: {details['consistency_loss'].item():.6f}")
+    print(f"    log keys: {list(details['log'].keys())}")
+    print(f"    log.step: {details['log']['step']}")
+    print(f"    log.num_groups: {details['log']['num_groups']}")
+    print("    [OK] 详细信息完整")
+
+    print()
+
+
+def demo_warmup_and_freeze():
+    print("=" * 60)
+    print("Demo 6: warmup 预热 & 模块冻结")
+    print("=" * 60)
+
+    smoother = AdaptiveLabelSmoother(
+        num_classes=10,
+        module_names=["h0", "h1", "h2"],
+        warmup_steps=8,
+    )
+
+    print(f"  warmup_steps: {smoother.warmup_steps}")
+    print(f"  初始 step=0, in_warmup={smoother.in_warmup}")
+
+    y = torch.randint(0, 10, (4,))
+    logits = {n: torch.randn(4, 10) for n in ["h0", "h1", "h2"]}
+
+    params_before = smoother.smoothing_modules["h0"].log_alpha.item()
+
+    for i in range(5):
+        smoother.training_loss(logits, y)
+
+    params_after_warmup = smoother.smoothing_modules["h0"].log_alpha.item()
+    print(f"  5 步后 (仍在 warmup): in_warmup={smoother.in_warmup}")
+    print(f"  h0 log_alpha 变化: {params_before:.6f} -> {params_after_warmup:.6f}")
+    print(f"  参数是否未变: {abs(params_before - params_after_warmup) < 1e-5}")
+
+    for i in range(5):
+        smoother.training_loss(logits, y)
+
+    params_after_adjust = smoother.smoothing_modules["h0"].log_alpha.item()
+    print(f"  10 步后 (已退出 warmup): in_warmup={smoother.in_warmup}")
+    print(f"  h0 log_alpha 变化: {params_after_warmup:.6f} -> {params_after_adjust:.6f}")
+
+    print()
+    print("  冻结 h1：")
+    smoother.freeze_module("h1")
+    print(f"  冻结模块: {smoother.get_frozen_modules()}")
+
+    params_h1_before = smoother.smoothing_modules["h1"].log_alpha.item()
+    for i in range(10):
+        smoother.training_loss(logits, y)
+    params_h1_after = smoother.smoothing_modules["h1"].log_alpha.item()
+    print(f"  10 步后 h1 log_alpha: {params_h1_before:.6f} -> {params_h1_after:.6f}")
+    print(f"  冻结参数是否未变: {abs(params_h1_before - params_h1_after) < 1e-5}")
+
+    smoother.unfreeze_module("h1")
+    print(f"  解冻后冻结模块: {smoother.get_frozen_modules()}")
+    print("  [OK] warmup 和冻结功能正常")
+    print()
+
+
+def demo_module_summary_and_curves():
+    print("=" * 60)
+    print("Demo 7: 模块汇总 & 曲线数据结构")
+    print("=" * 60)
+
+    torch.manual_seed(42)
+    smoother = AdaptiveLabelSmoother(
+        num_classes=10, module_names=["h0", "h1", "h2"],
+        merge_threshold=0.05, merge_window=8,
+    )
+
+    print("  训练 15 步...")
+    for i in range(15):
+        y = torch.randint(0, 10, (4,))
+        logits = {n: torch.randn(4, 10) for n in ["h0", "h1", "h2"]}
+        smoother.training_loss(logits, y)
+
+    summary = smoother.get_module_summary()
+    print(f"  模块汇总 - {len(summary)} 个模块:")
+    for name, s in summary.items():
+        print(f"    {name}:")
+        print(f"      当前组: {s['current_group_id']}")
+        print(f"      平滑均值: {s['current_smoothing_mean']:.4f}")
+        print(f"      平均平滑值: {s['avg_smoothing_mean']:.4f}")
+        print(f"      最大方差: {s['max_smoothing_var']:.6f}")
+        print(f"      合并次数: {s['merge_count']}, 分裂次数: {s['split_count']}")
+        print(f"      是否冻结: {s['is_frozen']}")
+
+    print()
+    curves = smoother.get_smoothing_curves()
+    print(f"  曲线数据结构:")
+    print(f"    steps 长度: {len(curves['steps'])}")
+    print(f"    num_groups 长度: {len(curves['num_groups'])}")
+    print(f"    per_module 模块数: {len(curves['per_module'])}")
+    print(f"    h0.smoothing_mean 长度: {len(curves['per_module']['h0']['smoothing_mean'])}")
+    print(f"    合并事件数: {len(curves['merge_events'])}")
+    print(f"    分裂事件数: {len(curves['split_events'])}")
+    print()
+    print("  [OK] 汇总和曲线数据正常")
+    print()
+
+
 def main():
     print()
-    print("  模块级自适应标签平滑器 v2.0")
+    print("  模块级自适应标签平滑器 v3.0")
     print()
 
     demo_compute_losses()
     demo_topology_merge()
     demo_save_load()
     demo_diagnostics()
+    demo_training_loss()
+    demo_warmup_and_freeze()
+    demo_module_summary_and_curves()
 
     print("=" * 60)
     print("  所有演示完成！")

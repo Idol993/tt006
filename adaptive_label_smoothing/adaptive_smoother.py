@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 import json
 import csv
 import io
@@ -33,6 +33,7 @@ class AdaptiveLabelSmoother(nn.Module):
                  adjust_lr: float = 0.05,
                  overfitting_patience: int = 5,
                  overfitting_delta: float = 0.01,
+                 warmup_steps: int = 0,
                  eps: float = 1e-6):
         super().__init__()
 
@@ -41,6 +42,8 @@ class AdaptiveLabelSmoother(nn.Module):
         self.eps = eps
         self._step_count = 0
         self._merge_split_interval = 50
+        self._warmup_steps = warmup_steps
+        self._frozen_modules: Set[str] = set()
 
         self.smoothing_modules = nn.ModuleDict()
         for name in self.module_names:
@@ -260,6 +263,108 @@ class AdaptiveLabelSmoother(nn.Module):
                                  reference_module: Optional[str] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
         return self.consistency_loss(module_smooth_labels, reference_module)
 
+    @property
+    def in_warmup(self) -> bool:
+        return self._step_count < self._warmup_steps
+
+    @property
+    def warmup_steps(self) -> int:
+        return self._warmup_steps
+
+    def set_warmup_steps(self, steps: int) -> None:
+        self._warmup_steps = max(0, steps)
+
+    def freeze_module(self, module_name: str) -> None:
+        if module_name in self.smoothing_modules:
+            self._frozen_modules.add(module_name)
+            self.smoothing_modules[module_name].freeze()
+
+    def unfreeze_module(self, module_name: str) -> None:
+        if module_name in self._frozen_modules:
+            self._frozen_modules.discard(module_name)
+            self.smoothing_modules[module_name].unfreeze()
+
+    def freeze_all(self) -> None:
+        for name in self.module_names:
+            self.freeze_module(name)
+
+    def unfreeze_all(self) -> None:
+        for name in self.module_names:
+            self.unfreeze_module(name)
+
+    def is_frozen(self, module_name: str) -> bool:
+        return module_name in self._frozen_modules
+
+    def get_frozen_modules(self) -> List[str]:
+        return sorted(self._frozen_modules)
+
+    def training_loss(self,
+                      module_logits: Dict[str, torch.Tensor],
+                      labels: torch.Tensor,
+                      module_val_accs: Optional[Dict[str, float]] = None,
+                      use_group_params: bool = True,
+                      reduction: str = "mean",
+                      return_details: bool = False) -> Any:
+        loss_result = self.compute_losses(
+            module_logits=module_logits,
+            labels=labels,
+            module_val_accs=module_val_accs,
+            use_group_params=use_group_params,
+            reduction=reduction,
+        )
+
+        total_loss = loss_result["total_loss"]
+
+        target_device = labels.device
+        if total_loss.device != target_device:
+            total_loss = total_loss.to(target_device)
+
+        if not return_details:
+            return total_loss
+
+        smooth_labels = loss_result["smooth_labels"]
+        for name, sl in smooth_labels.items():
+            if sl.device != target_device:
+                smooth_labels[name] = sl.to(target_device)
+
+        cons_loss = loss_result["consistency_loss"]
+        if cons_loss.device != target_device:
+            cons_loss = cons_loss.to(target_device)
+
+        cls_loss = loss_result["classification_loss"]
+        if isinstance(cls_loss, torch.Tensor) and cls_loss.device != target_device:
+            cls_loss = cls_loss.to(target_device)
+
+        per_module_loss = loss_result["per_module_loss"]
+        for name, pl in per_module_loss.items():
+            if isinstance(pl, torch.Tensor) and pl.device != target_device:
+                per_module_loss[name] = pl.to(target_device)
+
+        log = {
+            "step": loss_result["step"],
+            "total_loss": total_loss.item(),
+            "classification_loss": cls_loss.item() if isinstance(cls_loss, torch.Tensor) else cls_loss,
+            "consistency_loss": cons_loss.item() if isinstance(cons_loss, torch.Tensor) else cons_loss,
+            "num_groups": loss_result["smoothing_info"]["num_groups"],
+            "in_warmup": self.in_warmup,
+            "frozen_modules": self.get_frozen_modules(),
+            "topology_changed": loss_result["topology_info"] is not None,
+        }
+
+        details = {
+            "total_loss": total_loss,
+            "classification_loss": cls_loss,
+            "consistency_loss": cons_loss,
+            "per_module_loss": per_module_loss,
+            "smooth_labels": smooth_labels,
+            "smoothing_info": loss_result["smoothing_info"],
+            "topology_info": loss_result["topology_info"],
+            "step": loss_result["step"],
+            "log": log,
+        }
+
+        return total_loss, details
+
     def training_step(self,
                       labels: torch.Tensor,
                       module_probs: Dict[str, torch.Tensor],
@@ -269,7 +374,10 @@ class AdaptiveLabelSmoother(nn.Module):
 
         self.update_all_stats(module_probs)
 
-        adjust_results = self.adjust_all_smoothing()
+        if self.in_warmup:
+            adjust_results = {}
+        else:
+            adjust_results = self.adjust_all_smoothing()
 
         smooth_labels_dict = self.smooth_all_modules(
             labels=labels,
@@ -282,8 +390,10 @@ class AdaptiveLabelSmoother(nn.Module):
         )
 
         topology_info = None
-        if self._step_count % self._merge_split_interval == 0:
+        if not self.in_warmup and self._step_count % self._merge_split_interval == 0:
             topology_info = self.try_topology_reconstruction(module_val_accs)
+
+        self._record_diagnostic(self._step_count, adjust_results, topology_info)
 
         result = {
             "smooth_labels": smooth_labels_dict,
@@ -291,7 +401,8 @@ class AdaptiveLabelSmoother(nn.Module):
             "consistency_scores": consistency_scores,
             "adjust_results": adjust_results,
             "topology_info": topology_info,
-            "step": self._step_count
+            "step": self._step_count,
+            "in_warmup": self.in_warmup,
         }
 
         return result
@@ -402,6 +513,9 @@ class AdaptiveLabelSmoother(nn.Module):
         state[prefix + 'scheduler_best_val_acc'] = dict(self.scheduler._best_val_acc)
         state[prefix + 'scheduler_overfit_counter'] = dict(self.scheduler._overfit_counter)
 
+        state[prefix + 'warmup_steps'] = self._warmup_steps
+        state[prefix + 'frozen_modules'] = sorted(self._frozen_modules)
+
         topo_state = {}
         for gid, group in self.topology_manager._groups.items():
             topo_state[gid] = {
@@ -428,6 +542,7 @@ class AdaptiveLabelSmoother(nn.Module):
             'scheduler_val_acc_history', 'scheduler_best_val_acc', 'scheduler_overfit_counter',
             'topology_groups', 'topology_module_to_group', 'topology_module_history',
             'topology_next_group_id', 'topology_step_count', 'topology_overfitting_modules',
+            'warmup_steps', 'frozen_modules',
         ]
 
         extracted = {}
@@ -462,6 +577,18 @@ class AdaptiveLabelSmoother(nn.Module):
             self.scheduler._best_val_acc = dict(extracted['scheduler_best_val_acc'])
         if 'scheduler_overfit_counter' in extracted:
             self.scheduler._overfit_counter = dict(extracted['scheduler_overfit_counter'])
+
+        if 'warmup_steps' in extracted:
+            self._warmup_steps = extracted['warmup_steps']
+        if 'frozen_modules' in extracted:
+            self._frozen_modules = set(extracted['frozen_modules'])
+            for name in self.module_names:
+                if name in self.smoothing_modules:
+                    mod = self.smoothing_modules[name]
+                    if name in self._frozen_modules:
+                        mod.freeze()
+                    else:
+                        mod.unfreeze()
 
         from .topology_manager import SmoothGroup
         if 'topology_groups' in extracted:
@@ -632,43 +759,123 @@ class AdaptiveLabelSmoother(nn.Module):
 
         return events
 
-    def training_step(self,
-                      labels: torch.Tensor,
-                      module_probs: Dict[str, torch.Tensor],
-                      module_val_accs: Optional[Dict[str, float]] = None,
-                      use_group_params: bool = True) -> Dict[str, Any]:
-        self._step_count += 1
+    def get_module_summary(self) -> Dict[str, Dict[str, Any]]:
+        summaries = {}
 
-        self.update_all_stats(module_probs)
+        for name in self.module_names:
+            module = self.smoothing_modules[name]
+            group_id = self.topology_manager.get_module_group_map().get(name)
 
-        adjust_results = self.adjust_all_smoothing()
+            means = []
+            vars_ = []
+            confidences = []
+            entropies = []
+            group_ids = []
 
-        smooth_labels_dict = self.smooth_all_modules(
-            labels=labels,
-            module_probs=module_probs,
-            use_group_params=use_group_params
-        )
+            for entry in self._diagnostic_log:
+                if "module_stats" in entry and name in entry["module_stats"]:
+                    stats = entry["module_stats"][name]
+                    means.append(stats.get("smoothing_mean", 0.0))
+                    vars_.append(stats.get("smoothing_var", 0.0))
+                    confidences.append(stats.get("confidence", 0.0))
+                    entropies.append(stats.get("marginal_entropy", 0.0))
+                    group_ids.append(stats.get("group_id", -1))
 
-        consistency_loss_val, consistency_scores = self.compute_consistency_loss(
-            smooth_labels_dict
-        )
+            merge_count = 0
+            split_count = 0
+            group_transitions = []
+            prev_gid = None
+            for gid in group_ids:
+                if prev_gid is not None and gid != prev_gid:
+                    group_transitions.append({
+                        "from_group": prev_gid,
+                        "to_group": gid,
+                    })
+                prev_gid = gid
 
-        topology_info = None
-        if self._step_count % self._merge_split_interval == 0:
-            topology_info = self.try_topology_reconstruction(module_val_accs)
+            unique_groups = set(group_ids) if group_ids else {group_id}
+            if len(unique_groups) > 1:
+                merge_count = max(0, len(unique_groups) - len(set([gid for gid in unique_groups if gid is not None])))
 
-        self._record_diagnostic(self._step_count, adjust_results, topology_info)
+            events = self.get_merge_split_events()
+            for ev in events["merge_events"]:
+                merge_count += 1
+            for ev in events["split_events"]:
+                split_count += 1
 
-        result = {
-            "smooth_labels": smooth_labels_dict,
-            "consistency_loss": consistency_loss_val,
-            "consistency_scores": consistency_scores,
-            "adjust_results": adjust_results,
-            "topology_info": topology_info,
-            "step": self._step_count
+            summary = {
+                "module_name": name,
+                "current_group_id": group_id,
+                "current_smoothing_mean": module.smoothing_mean.item(),
+                "current_smoothing_var": module.smoothing_var.item(),
+                "current_confidence": module.ema_confidence.item(),
+                "current_marginal_entropy": module.ema_marginal_entropy.item(),
+                "avg_smoothing_mean": sum(means) / len(means) if means else 0.0,
+                "max_smoothing_mean": max(means) if means else 0.0,
+                "min_smoothing_mean": min(means) if means else 0.0,
+                "max_smoothing_var": max(vars_) if vars_ else 0.0,
+                "avg_confidence": sum(confidences) / len(confidences) if confidences else 0.0,
+                "avg_marginal_entropy": sum(entropies) / len(entropies) if entropies else 0.0,
+                "merge_count": len(events["merge_events"]),
+                "split_count": len(events["split_events"]),
+                "group_transitions": group_transitions,
+                "is_frozen": self.is_frozen(name),
+            }
+            summaries[name] = summary
+
+        return summaries
+
+    def get_smoothing_curves(self) -> Dict[str, Any]:
+        steps = []
+        num_groups = []
+
+        per_module = {}
+        for name in self.module_names:
+            per_module[name] = {
+                "smoothing_mean": [],
+                "smoothing_var": [],
+                "confidence": [],
+                "marginal_entropy": [],
+                "group_id": [],
+            }
+
+        for entry in self._diagnostic_log:
+            steps.append(entry["step"])
+            num_groups.append(entry.get("num_groups", 0))
+
+            for name, stats in entry.get("module_stats", {}).items():
+                if name in per_module:
+                    per_module[name]["smoothing_mean"].append(stats.get("smoothing_mean", 0.0))
+                    per_module[name]["smoothing_var"].append(stats.get("smoothing_var", 0.0))
+                    per_module[name]["confidence"].append(stats.get("confidence", 0.0))
+                    per_module[name]["marginal_entropy"].append(stats.get("marginal_entropy", 0.0))
+                    per_module[name]["group_id"].append(stats.get("group_id", -1))
+
+        merged_events = []
+        split_events = []
+        for entry in self._diagnostic_log:
+            step = entry["step"]
+            for mp in entry.get("merged_pairs", []):
+                merged_events.append({
+                    "step": step,
+                    "group_a": mp["group_a"],
+                    "group_b": mp["group_b"],
+                })
+            for sg in entry.get("split_groups", []):
+                split_events.append({
+                    "step": step,
+                    "group_id": sg,
+                })
+
+        curves = {
+            "steps": steps,
+            "num_groups": num_groups,
+            "per_module": per_module,
+            "merge_events": merged_events,
+            "split_events": split_events,
         }
 
-        return result
+        return curves
 
     def extra_repr(self) -> str:
         return (f"num_classes={self.num_classes}, "

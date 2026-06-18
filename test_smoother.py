@@ -688,6 +688,232 @@ class TestAdaptiveLabelSmoother(unittest.TestCase):
 
         self.assertEqual(len(self.smoother.get_diagnostic_log()), initial_len)
 
+    def test_training_loss_simple(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes, requires_grad=True)
+            logits_dict[name] = logits
+
+        loss = self.smoother.training_loss(logits_dict, labels)
+
+        self.assertIsInstance(loss, torch.Tensor)
+        self.assertEqual(loss.shape, torch.Size([]))
+        self.assertTrue(loss.requires_grad)
+
+    def test_training_loss_with_details(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        loss, details = self.smoother.training_loss(
+            logits_dict, labels, return_details=True
+        )
+
+        self.assertIsInstance(loss, torch.Tensor)
+        self.assertIn("total_loss", details)
+        self.assertIn("classification_loss", details)
+        self.assertIn("consistency_loss", details)
+        self.assertIn("per_module_loss", details)
+        self.assertIn("smooth_labels", details)
+        self.assertIn("log", details)
+        self.assertIn("step", details["log"])
+        self.assertIn("num_groups", details["log"])
+
+    def test_training_loss_device_consistency(self):
+        device = torch.device("cpu")
+        labels = torch.tensor([0, 1, 2, 3], device=device)
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes, device=device)
+            logits_dict[name] = logits
+
+        loss, details = self.smoother.training_loss(
+            logits_dict, labels, return_details=True
+        )
+
+        self.assertEqual(loss.device, device)
+        self.assertEqual(details["consistency_loss"].device, device)
+        for name, sl in details["smooth_labels"].items():
+            self.assertEqual(sl.device, device)
+        for name, pl in details["per_module_loss"].items():
+            self.assertEqual(pl.device, device)
+
+    def test_warmup_mode(self):
+        warmup_smoother = AdaptiveLabelSmoother(
+            num_classes=self.num_classes,
+            module_names=self.module_names,
+            warmup_steps=10,
+        )
+
+        self.assertTrue(warmup_smoother.in_warmup)
+        self.assertEqual(warmup_smoother.warmup_steps, 10)
+
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        params_before = {}
+        for name in self.module_names:
+            mod = warmup_smoother.smoothing_modules[name]
+            params_before[name] = (mod.log_alpha.item(), mod.log_beta.item())
+
+        for i in range(5):
+            result = warmup_smoother.compute_losses(logits_dict, labels)
+
+        for name in self.module_names:
+            mod = warmup_smoother.smoothing_modules[name]
+            alpha_after, beta_after = mod.log_alpha.item(), mod.log_beta.item()
+            self.assertAlmostEqual(params_before[name][0], alpha_after, places=5)
+            self.assertAlmostEqual(params_before[name][1], beta_after, places=5)
+
+        self.assertTrue(warmup_smoother.in_warmup)
+
+        for i in range(6):
+            result = warmup_smoother.compute_losses(logits_dict, labels)
+
+        self.assertFalse(warmup_smoother.in_warmup)
+
+    def test_freeze_module(self):
+        mod_name = self.module_names[0]
+        mod = self.smoother.smoothing_modules[mod_name]
+
+        self.assertFalse(self.smoother.is_frozen(mod_name))
+        self.assertFalse(mod.frozen)
+
+        self.smoother.freeze_module(mod_name)
+
+        self.assertTrue(self.smoother.is_frozen(mod_name))
+        self.assertTrue(mod.frozen)
+
+        params_before = (mod.log_alpha.item(), mod.log_beta.item())
+
+        for _ in range(10):
+            mod.adjust_beta_params(0.3, 0.01, lr=0.5)
+
+        params_after = (mod.log_alpha.item(), mod.log_beta.item())
+        self.assertAlmostEqual(params_before[0], params_after[0], places=5)
+        self.assertAlmostEqual(params_before[1], params_after[1], places=5)
+
+        self.smoother.unfreeze_module(mod_name)
+        self.assertFalse(self.smoother.is_frozen(mod_name))
+        self.assertFalse(mod.frozen)
+
+    def test_freeze_all_unfreeze_all(self):
+        self.smoother.freeze_all()
+
+        for name in self.module_names:
+            self.assertTrue(self.smoother.is_frozen(name))
+            self.assertTrue(self.smoother.smoothing_modules[name].frozen)
+
+        self.assertEqual(len(self.smoother.get_frozen_modules()), len(self.module_names))
+
+        self.smoother.unfreeze_all()
+
+        for name in self.module_names:
+            self.assertFalse(self.smoother.is_frozen(name))
+            self.assertFalse(self.smoother.smoothing_modules[name].frozen)
+
+        self.assertEqual(len(self.smoother.get_frozen_modules()), 0)
+
+    def test_module_summary(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        for _ in range(5):
+            self.smoother.compute_losses(logits_dict, labels)
+
+        summary = self.smoother.get_module_summary()
+
+        self.assertEqual(len(summary), len(self.module_names))
+        for name in self.module_names:
+            self.assertIn(name, summary)
+            self.assertIn("current_smoothing_mean", summary[name])
+            self.assertIn("current_group_id", summary[name])
+            self.assertIn("avg_smoothing_mean", summary[name])
+            self.assertIn("max_smoothing_var", summary[name])
+            self.assertIn("merge_count", summary[name])
+            self.assertIn("split_count", summary[name])
+            self.assertIn("is_frozen", summary[name])
+
+    def test_smoothing_curves(self):
+        labels = torch.tensor([0, 1, 2, 3])
+        logits_dict = {}
+        for name in self.module_names:
+            logits = torch.randn(4, self.num_classes)
+            logits_dict[name] = logits
+
+        n_steps = 5
+        for _ in range(n_steps):
+            self.smoother.compute_losses(logits_dict, labels)
+
+        curves = self.smoother.get_smoothing_curves()
+
+        self.assertIn("steps", curves)
+        self.assertIn("num_groups", curves)
+        self.assertIn("per_module", curves)
+        self.assertIn("merge_events", curves)
+        self.assertIn("split_events", curves)
+
+        self.assertEqual(len(curves["steps"]), n_steps)
+        self.assertEqual(len(curves["num_groups"]), n_steps)
+
+        for name in self.module_names:
+            self.assertIn(name, curves["per_module"])
+            self.assertIn("smoothing_mean", curves["per_module"][name])
+            self.assertIn("smoothing_var", curves["per_module"][name])
+            self.assertIn("confidence", curves["per_module"][name])
+            self.assertIn("marginal_entropy", curves["per_module"][name])
+            self.assertIn("group_id", curves["per_module"][name])
+            self.assertEqual(len(curves["per_module"][name]["smoothing_mean"]), n_steps)
+
+    def test_strict_merge_window(self):
+        from adaptive_label_smoothing import TopologyManager
+
+        tm = TopologyManager(
+            num_classes=self.num_classes,
+            merge_threshold=0.02,
+            merge_window=5,
+        )
+        tm.register_module("mod_a", init_alpha=2.0, init_beta=10.0)
+        tm.register_module("mod_b", init_alpha=2.0, init_beta=10.0)
+
+        for i in range(7):
+            val_a = 0.10 + 0.001 * i
+            val_b = 0.10
+            tm.record_smoothing_value("mod_a", val_a)
+            tm.record_smoothing_value("mod_b", val_b)
+
+        merged = tm.try_merge_groups()
+        self.assertEqual(len(merged), 1)
+
+    def test_merge_rejects_jittery_modules(self):
+        from adaptive_label_smoothing import TopologyManager
+
+        tm = TopologyManager(
+            num_classes=self.num_classes,
+            merge_threshold=0.02,
+            merge_window=5,
+        )
+        tm.register_module("mod_a", init_alpha=2.0, init_beta=10.0)
+        tm.register_module("mod_b", init_alpha=2.0, init_beta=10.0)
+
+        for i in range(7):
+            val_a = 0.10 if i % 2 == 0 else 0.20
+            val_b = 0.15
+            tm.record_smoothing_value("mod_a", val_a)
+            tm.record_smoothing_value("mod_b", val_b)
+
+        merged = tm.try_merge_groups()
+        self.assertEqual(len(merged), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
